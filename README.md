@@ -22,20 +22,20 @@ channel) ships as empty templates for you to fill in — see the
                  headless-siem (data/, siemctl, alert-watch)
                               │  digest / alerts / search
                               ▼
-        ┌───────────────────────────────────────────────┐
-        │                  4 roles                        │
-        │  analyst    — short interval, triages the digest,│
-        │               opens tickets for anything odd     │
-        │  specialist — hourly, drains tickets assigned     │
-        │               to it, investigates against         │
-        │               runbooks, closes or escalates       │
-        │  tuner-dev  — every few hours, the only role with  │
-        │               write access to headless-siem; fixes  │
-        │               noise/parsing/tuning tickets via a      │
-        │               branch + scripts/tuner-review            │
-        │  soclead    — nightly + weekly, reports on the SOC's  │
-        │               own output over time (no investigation) │
-        └───────────────────────────────────────────────┘
+        ┌─────────────────────────────────────────────────────────┐
+        │                  4 roles                                │
+        │  analyst    — short interval, triages the digest,       │
+        │               opens tickets for anything odd            │
+        │  specialist — hourly, drains tickets assigned           │
+        │               to it, investigates against               │
+        │               runbooks, closes or escalates             │
+        │  tuner-dev  — every few hours, the only role with       │
+        │               write access to headless-siem; fixes      │
+        │               noise/parsing/tuning tickets via a        │
+        │               branch + scripts/tuner-review             │
+        │  soclead    — nightly + weekly, reports on the SOC's    │
+        │               own output over time (no investigation)   │
+        └─────────────────────────────────────────────────────────┘
                               │  ticketing-system/<role>/*.md
                               ▼
         human operator (scripts/soc-ticket, scripts/soc-run-role, ...)
