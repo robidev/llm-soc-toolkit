@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# scripts/soc-session-cleanup — deletes old per-invocation session
+# transcripts under /var/lib/soc/<role>/.claude/projects/ (phase7
+# housekeeping build, cluster 1 item B / §7.2), so 4 roles' worth of
+# never-`--resume`d session state doesn't grow unbounded on disk.
+#
+# Root, unsandboxed — must delete files owned by 4 different
+# soc-<role> accounts, same reason soc-escalate/context-balloon-scan
+# need root. Run weekly via config/systemd/soc-session-cleanup.timer;
+# neither existing timer (headless-siem-retention, soc-baseline)
+# can be reused since both run as unprivileged `user`.
+#
+# Never touches permission-audit/ or agent-logs/ — entirely separate
+# directory trees from .claude/projects/.
+#
+# Retention window resolution (first match wins):
+#   1. --days N on the command line
+#   2. /etc/soc/session-cleanup-days, if present and an integer (same
+#      "small root-owned config file" convention as /etc/soc/hook-mode-<role>)
+#   3. default: 14 days (shorter than headless-siem's 30-day raw
+#      retention since these transcripts are throwaway and never resumed)
+#
+# For each role, if /run/soc/<role>.lock (the exact lock soc-run-role
+# itself takes) is currently held, the whole role is skipped this run
+# rather than racing a live session.
+#
+# USAGE: soc-session-cleanup [--days N] [--dry-run]   (must run as root)
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOC_LIB="${SOC_LIB:-/var/lib/soc}"           # env override for testing, same pattern as context-balloon-scan
+LOCK_DIR="${LOCK_DIR:-/run/soc}"             # env override for testing
+DAYS_FILE="${DAYS_FILE:-/etc/soc/session-cleanup-days}"  # env override for testing
+DEFAULT_DAYS=14
+
+ROLES="analyst specialist tuner-dev soclead"
+
+log() { echo "[soc-session-cleanup] $*" >&2; }
+
+DAYS=""
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --days)
+            DAYS="$2"; shift 2 ;;
+        --dry-run)
+            DRY_RUN=1; shift ;;
+        *)
+            echo "usage: $0 [--days N] [--dry-run]" >&2
+            exit 1 ;;
+    esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+    log "must run as root (deletes across all soc-<role>-owned homes) — try: sudo $0"
+    exit 1
+fi
+
+if [ -z "$DAYS" ] && [ -f "$DAYS_FILE" ]; then
+    file_val="$(tr -d '[:space:]' < "$DAYS_FILE")"
+    if [[ "$file_val" =~ ^[0-9]+$ ]]; then
+        DAYS="$file_val"
+    else
+        log "WARNING: $DAYS_FILE does not parse as an integer ('$file_val'), ignoring"
+    fi
+fi
+DAYS="${DAYS:-$DEFAULT_DAYS}"
+if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+    log "invalid --days value: '$DAYS'"
+    exit 1
+fi
+
+log "retention window: $DAYS day(s)$([ "$DRY_RUN" -eq 1 ] && echo ' (dry-run)')"
+
+exit_code=0
+total_deleted=0
+
+for role in $ROLES; do
+    role_home="$SOC_LIB/${role/tuner-dev/tunerdev}"   # same substitution soc-run-role uses to derive $home
+    projects_dir="$role_home/.claude/projects"
+    lock_file="$LOCK_DIR/$role.lock"                  # same path soc-run-role itself locks
+
+    [ -d "$projects_dir" ] || continue   # role has never had a session yet
+
+    mkdir -p "$LOCK_DIR"
+    exec 8>"$lock_file"
+    if ! flock -n 8; then
+        log "$role: still running (lock held), skipping this role"
+        exec 8>&-
+        continue
+    fi
+
+    role_deleted=0
+    while IFS= read -r -d '' jsonl; do
+        dir="${jsonl%.jsonl}"   # sibling <uuid>/ dir, same basename minus .jsonl
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "$role: would delete $jsonl$([ -d "$dir" ] && echo " (+ sibling dir)")"
+            role_deleted=$((role_deleted + 1))
+            continue
+        fi
+
+        if rm -f "$jsonl" && { [ ! -d "$dir" ] || rm -rf "$dir"; }; then
+            role_deleted=$((role_deleted + 1))
+        else
+            log "$role: failed to delete $jsonl"
+            exit_code=1
+        fi
+    done < <(find "$projects_dir" -mindepth 2 -maxdepth 2 -name '*.jsonl' -mtime "+$DAYS" -print0 2>/dev/null)
+
+    exec 8>&-   # releases the flock
+
+    [ "$role_deleted" -gt 0 ] && log "$role: $([ "$DRY_RUN" -eq 1 ] && echo would delete || echo deleted) $role_deleted session(s)"
+    total_deleted=$((total_deleted + role_deleted))
+done
+
+log "done: $total_deleted session(s) $([ "$DRY_RUN" -eq 1 ] && echo would be deleted || echo deleted) across all roles"
+exit "$exit_code"

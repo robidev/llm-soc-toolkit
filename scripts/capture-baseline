@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Captures a daily siemctl digest snapshot for the baseline soak. Run once daily (see
+# config/systemd/soc-baseline.timer) for 3-7 days with no agents
+# touching the SIEM, so the digest's delta logic has real noise-profile
+# history and runbooks can be written from actual FPs, not guesses.
+#
+# Usage: capture-baseline [data-dir] [output-dir]
+#   data-dir    default: /var/lib/headless-siem
+#   output-dir  default: <repo>/soc_context/baselines
+
+set -uo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DATA_DIR="${1:-/var/lib/headless-siem}"
+OUT_DIR="${2:-$PROJECT_ROOT/soc_context/baselines}"
+
+mkdir -p "$OUT_DIR"
+
+DATE="$(date -u +%Y-%m-%d)"
+TEXT_OUT="$OUT_DIR/$DATE.txt"
+JSON_OUT="$OUT_DIR/$DATE.json"
+
+# A retry here guards against transient "siem db unavailable" failures --
+# e.g. a momentary lock while indexd rotates a bucket. A single short
+# retry is kept as cheap insurance against a genuine momentary filesystem
+# hiccup, rather than leaving the day's baseline missing.
+run_digest() {
+    local fmt="$1" out="$2" attempt
+    for attempt in 1 2; do
+        if siemctl digest --data-dir "$DATA_DIR" --window 24h --format "$fmt" > "$out.tmp" 2>"$out.err"; then
+            mv "$out.tmp" "$out"
+            rm -f "$out.err"
+            return 0
+        fi
+        echo "[capture-baseline] attempt $attempt ($fmt) failed, retrying in 2s:" >&2
+        cat "$out.err" >&2
+        rm -f "$out.tmp"
+        sleep 2
+    done
+    rm -f "$out.err"
+    return 1
+}
+
+run_digest text "$TEXT_OUT" && run_digest json "$JSON_OUT"
+status=$?
+
+if [ "$status" -eq 0 ]; then
+    echo "[capture-baseline] wrote $TEXT_OUT and $JSON_OUT"
+else
+    echo "[capture-baseline] FAILED after retries — no output written for $DATE" >&2
+fi
+exit "$status"

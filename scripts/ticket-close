@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""ticket-close <path> ["comment"]
+
+Unprivileged helper for a role to close a ticket it already OWNS
+(sitting in its own folder) -- same gap shape as ticket-reassign,
+just for closing instead of reassigning: a role
+resolving a ticket in place has always been told (ticketing-system/
+system.md, each role's own prompt) to "append findings, set status:
+closed, rename the file with the CLOSED_ prefix" as a raw multi-step
+edit + `mv`, which was never allow-listed -- harmless under audit mode
+(logged, not blocked) but a real DENY in enforce mode. Found 2026-07-11:
+two tuner-dev tickets ended up split-brain (status: closed in the
+frontmatter, but never renamed) because the enforce-mode `mv` was
+denied mid-close and the run moved on without it.
+
+Sets status: closed and closed: <now, computed here -- never trusts the
+caller to format it, closing the same "which timestamp format" gap
+found in agent-logs/analyst.log the same day>, optionally appends a
+closing Comments line, then renames to CLOSED_<original> -- all in one
+call, same-directory only (os.rename is atomic within one directory; no
+tmp-file dance needed the way ticket-reassign's cross-directory move
+does).
+
+No privilege escalation needed: the ticket already sits in the caller's
+own ticketing-system/<role>/ folder, already in the caller's own
+ReadWritePaths (scripts/soc-run-role's rw array) -- this just needed a
+Bash-allowlist entry for the hook to let the *script* run, same as
+ticket-route/ticket-reassign. Ownership is read from the CLAUDE_ROLE
+environment variable soc-run-role sets for every sandboxed invocation --
+not a claimed argument -- so a role can only ever close a ticket
+actually sitting in ITS OWN folder.
+
+Exit 0 and print "OK: ..." on success. Exit 1 and print a reason
+otherwise. Never edits/renames anything on a validation failure.
+"""
+import sys
+import os
+import re
+import datetime
+
+SOC_ROOT = os.environ.get("SOC_ROOT", "/home/user/projects/llm-soc-toolkit")  # [SOC-ROOT-PATH]; env override for testing
+TS = os.path.join(SOC_ROOT, "ticketing-system")
+
+FNAME_RE = re.compile(r"^\d{8}T\d{6}\.\d+_[a-z0-9-]+\.md$")  # never CLOSED_ already -- can't close twice
+# Roles that can OWN a ticket in the first place (analyst's own folder
+# is not a real queue -- ticketing-system/system.md -- so it never has
+# anything of its own to close; same set ticket-reassign uses).
+OWNING_ROLES = {"specialist", "tuner-dev", "soclead"}
+
+
+def die(msg):
+    print("ticket-close: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def main():
+    if len(sys.argv) not in (2, 3):
+        die("usage: ticket-close <path> [\"comment\"]")
+    arg = sys.argv[1]
+    comment = sys.argv[2] if len(sys.argv) == 3 else None
+
+    caller = os.environ.get("CLAUDE_ROLE", "")
+    if caller not in OWNING_ROLES:
+        die("CLAUDE_ROLE=%r cannot own/close tickets" % caller)
+
+    base = os.path.basename(arg)
+    if not FNAME_RE.match(base):
+        die("not a valid, closeable (open, non-CLOSED) ticket filename: %s" % base)
+
+    own_dir = os.path.join(TS, caller)
+    try:
+        own_real = os.path.realpath(own_dir)
+        src_real = os.path.realpath(arg)
+    except OSError as e:
+        die("cannot resolve path: %s" % e)
+    if os.path.dirname(src_real) != own_real:
+        die("%s is not in your own folder (ticketing-system/%s/)" % (base, caller))
+    if not os.path.isfile(src_real) or os.path.islink(arg):
+        die("not a regular file: %s" % base)
+
+    try:
+        with open(src_real) as f:
+            content = f.read()
+    except OSError as e:
+        die("cannot read %s: %s" % (base, e))
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        die("%s doesn't look like a well-formed ticket (no frontmatter)" % base)
+
+    if comment:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += "- %s %s: %s\n" % (now_iso(), caller, comment)
+        parts = content.split("---", 2)
+
+    ts = now_iso()
+    fm_lines = []
+    saw_status = saw_closed = False
+    for line in parts[1].splitlines():
+        if line.startswith("status:"):
+            fm_lines.append("status: closed")
+            saw_status = True
+        elif line.startswith("closed:"):
+            fm_lines.append("closed: %s" % ts)
+            saw_closed = True
+        else:
+            fm_lines.append(line)
+    if not saw_status:
+        fm_lines.append("status: closed")
+    if not saw_closed:
+        fm_lines.append("closed: %s" % ts)
+    parts[1] = "\n".join(fm_lines) + "\n"
+    new_content = "---".join(parts)
+
+    dest_path = os.path.join(own_real, "CLOSED_" + base)
+    if os.path.exists(dest_path):
+        die("refusing to overwrite existing %s" % dest_path)
+
+    # Write the updated content back to the ORIGINAL path first, then
+    # rename -- if the rename fails partway, the ticket is left fully
+    # updated (status/closed/comment) under its original name rather
+    # than in some half-written state, and is safe to retry.
+    try:
+        with open(src_real, "w") as f:
+            f.write(new_content)
+        os.rename(src_real, dest_path)
+    except OSError as e:
+        die("failed to close %s: %s" % (base, e))
+
+    print("OK: closed %s/%s -> CLOSED_%s" % (caller, base, base))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

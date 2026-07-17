@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM-based SOC - Weekly Session Transcript Cleanup
+Documentation=file:///home/user/projects/llm-soc-toolkit/scripts/soc-session-cleanup
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/user/projects/llm-soc-toolkit
+ExecStart=/home/user/projects/llm-soc-toolkit/scripts/soc-session-cleanup
+StandardOutput=journal
+StandardError=journal
+
+# Root, unsandboxed: must delete /var/lib/soc/<role>/.claude/projects/
+# session files owned by 4 different soc-<role> accounts, plus read
+# /etc/soc/session-cleanup-days. No systemd sandboxing directives here
+# (matches soc-escalate/context-balloon-scan/heal-permissions, which are
+# also root, unsandboxed, for the same reason) — ProtectSystem=strict or
+# ReadWritePaths scoping would have to cover 4 separate soc-<role> home
+# trees plus /etc/soc, which is the same breadth as no restriction at all.

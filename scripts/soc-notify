@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# soc-notify — the single wrapper every SOC role calls to push a
+# notification to the human operator. See
+# documentation/escalation.md for the full spec (who may
+# call it at what priority, rate limits, kill-switch interaction) — this
+# is the implementation.
+#
+# USAGE:
+#   soc-notify <priority> <subject> <body-file> [type]
+#
+#   priority    low | medium | high | critical
+#   subject     short string, becomes the notification title
+#   body-file   path to a file with the notification body (never inline on
+#               the command line — keeps multi-line content and shell
+#               metacharacters safe)
+#   type        optional alert-type tag (e.g. "permission_gap",
+#               "context_balloon") checked against config/notify-types.toml
+#               — if that file sets this type to `false`, the send is
+#               skipped (exit 0) without touching rate-limit counters.
+#               Omit it (as every LLM-role caller does) and this file has
+#               no effect — fail-open, always sends. See
+#               documentation/escalation.md.
+#
+# Exit 0 on successful delivery (or on a deliberate no-op: paused, or
+# rate-limited — see below), non-zero on an actual delivery failure.
+#
+# BACKEND: ntfy.sh (server + topic in config/notify.conf, not hardcoded
+# here — swapping to a self-hosted ntfy instance later is a one-line
+# config edit, no script change).
+#
+# RATE LIMITING: `critical` has
+# its own separate MAX_PER_HOUR bucket, so a flood of lower-priority
+# traffic (including a duplicate-incident flood from before the analyst's
+# own dedupe) can never starve a genuine critical page. Within
+# the shared low/medium/high bucket, the last HIGH_RESERVE slots of each
+# hour are reserved for `high` only — `low`/`medium` can fill at most
+# MAX_PER_HOUR - HIGH_RESERVE slots, so routine/informational volume can't
+# exhaust the hour and crowd out a real incident notification.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONF="$PROJECT_ROOT/config/notify.conf"
+TYPES_CONF="$PROJECT_ROOT/config/notify-types.toml"
+PAUSED_FLAG="$PROJECT_ROOT/PAUSED"
+COUNT_DIR="$PROJECT_ROOT/.notify-count"
+MAX_PER_HOUR=10
+HIGH_RESERVE=3
+LOW_MED_CAP=$((MAX_PER_HOUR - HIGH_RESERVE))
+
+log() { echo "[soc-notify] $*" >&2; }
+
+usage() {
+    echo "Usage: soc-notify <low|medium|high|critical> <subject> <body-file> [type]" >&2
+}
+
+# Looks up "<type> = false" in config/notify-types.toml. Fail open on
+# anything short of an explicit `false` — missing file, missing key, no
+# type given at all — so this never silently swallows a caller that
+# doesn't know about the file.
+type_enabled() {  # <type>
+    local t="$1" val
+    [ -n "$t" ] || return 0
+    [ -f "$TYPES_CONF" ] || return 0
+    val="$(awk -F= -v key="$t" '
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            n = split(line, parts, "=")
+            if (n >= 2) {
+                k = parts[1]; gsub(/[ \t]/, "", k)
+                if (k == key) { v = parts[2]; gsub(/[ \t]/, "", v); print v }
+            }
+        }' "$TYPES_CONF" | tail -n1)"
+    [ "$val" = "false" ] && return 1
+    return 0
+}
+
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+    usage
+    exit 1
+fi
+
+priority="$1"
+subject="$2"
+body_file="$3"
+alert_type="${4:-}"
+
+# Subject becomes a raw HTTP header value below (-H "Title: $subject") and
+# can originate from LLM-authored ticket/alert content that this SOC's own
+# threat model treats as attacker-controlled (see prompts/analyst.md's "Why
+# tool scope matters"). Strip CR/LF so an embedded newline can't inject a
+# second header or split the request — collapse to spaces, don't just drop,
+# so the title stays readable if it legitimately had none.
+subject="$(printf '%s' "$subject" | tr '\r\n' '  ')"
+
+case "$priority" in
+    low|medium|high|critical) ;;
+    *)
+        log "invalid priority '$priority' (expected low|medium|high|critical)"
+        usage
+        exit 1
+        ;;
+esac
+
+if [ ! -f "$body_file" ]; then
+    log "body file not found: $body_file"
+    exit 1
+fi
+
+# ── Kill switch ───────────────────────────────────────────────────────────
+# A paused SOC is silent by design — no "I'm paused" spam either.
+if [ -f "$PAUSED_FLAG" ]; then
+    exit 0
+fi
+
+# ── Alert-type filtering (config/notify-types.toml) ──────────────────────
+# Checked before rate-limit bookkeeping so a disabled type doesn't burn a
+# slot in the hourly cap, and before the notify.conf/NTFY_* validation
+# below since a skipped send doesn't need either.
+if ! type_enabled "$alert_type"; then
+    log "skipped (disabled in config/notify-types.toml): type=$alert_type [$priority] $subject"
+    exit 0
+fi
+
+# ── Config ────────────────────────────────────────────────────────────────
+if [ ! -f "$CONF" ]; then
+    log "missing config: $CONF"
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONF"
+if [ -z "${NTFY_SERVER:-}" ] || [ -z "${NTFY_TOPIC:-}" ]; then
+    log "config $CONF must set NTFY_SERVER and NTFY_TOPIC"
+    exit 1
+fi
+
+# ── Rate limit bookkeeping ────────────────────────────────────────────────
+# Two independent buckets per hour: the shared low/medium/high bucket
+# (`.sent`/`.dropped`), and critical's own bucket (`.critical.sent`/
+# `.critical.dropped`) — see the file-header note above for why.
+mkdir -p "$COUNT_DIR"
+hour_bucket="$(date -u '+%Y%m%d%H')"
+prev_bucket="$(date -u -d '1 hour ago' '+%Y%m%d%H' 2>/dev/null || date -u -v-1H '+%Y%m%d%H' 2>/dev/null || echo "")"
+
+shared_sent_file="$COUNT_DIR/$hour_bucket.sent"
+shared_dropped_file="$COUNT_DIR/$hour_bucket.dropped"
+crit_sent_file="$COUNT_DIR/$hour_bucket.critical.sent"
+crit_dropped_file="$COUNT_DIR/$hour_bucket.critical.dropped"
+
+read_count() {
+    local f="$1" v=0
+    [ -f "$f" ] && v="$(cat "$f" 2>/dev/null || echo 0)"
+    case "$v" in ''|*[!0-9]*) v=0 ;; esac
+    # Force base-10: a stray leading zero (e.g. a hand-edited or corrupted
+    # counter file containing "008") would otherwise make bash's `$(( ))`
+    # in inc_count() treat it as an invalid octal literal and crash the
+    # whole script. Normalizing here means every caller always gets a
+    # clean decimal value regardless of how it got written to disk.
+    echo "$((10#$v))"
+}
+
+inc_count() {
+    local f="$1"
+    local v
+    v="$(read_count "$f")"
+    printf '%s' "$((v + 1))" > "$f"
+}
+
+# Resolve which bucket/cap this priority uses exactly once, so the
+# rate-limit check below and the increment further down can never
+# disagree about which counter file backs this call.
+case "$priority" in
+    critical) sent_file="$crit_sent_file"; dropped_file="$crit_dropped_file"; cap="$MAX_PER_HOUR" ;;
+    high)     sent_file="$shared_sent_file"; dropped_file="$shared_dropped_file"; cap="$MAX_PER_HOUR" ;;
+    *)        sent_file="$shared_sent_file"; dropped_file="$shared_dropped_file"; cap="$LOW_MED_CAP" ;;
+esac
+
+sent="$(read_count "$sent_file")"
+if [ "$sent" -ge "$cap" ]; then
+    inc_count "$dropped_file"
+    log "rate limit hit ($cap/hour cap for priority=$priority) — dropped: [$priority] $subject"
+    exit 0
+fi
+
+# If the previous hour dropped anything (either bucket), prepend a summary
+# to this send so the drop isn't silent forever — then clear those
+# counters so the summary is only shown once.
+suppressed_prefix=""
+if [ -n "$prev_bucket" ]; then
+    prev_shared_dropped="$(read_count "$COUNT_DIR/$prev_bucket.dropped")"
+    prev_crit_dropped="$(read_count "$COUNT_DIR/$prev_bucket.critical.dropped")"
+    prev_total_dropped=$((prev_shared_dropped + prev_crit_dropped))
+    if [ "$prev_total_dropped" -gt 0 ]; then
+        suppressed_prefix="[$prev_total_dropped notification(s) suppressed in the prior hour — see agent-logs/]"$'\n\n'
+        rm -f "$COUNT_DIR/$prev_bucket.sent" "$COUNT_DIR/$prev_bucket.dropped" \
+              "$COUNT_DIR/$prev_bucket.critical.sent" "$COUNT_DIR/$prev_bucket.critical.dropped"
+    fi
+fi
+
+# ── Priority mapping (ours -> ntfy's) ────────────────────────────────────
+case "$priority" in
+    low)      ntfy_priority="low";     tags="information_source" ;;
+    medium)   ntfy_priority="default"; tags="warning" ;;
+    high)     ntfy_priority="high";    tags="rotating_light" ;;
+    critical) ntfy_priority="urgent";  tags="rotating_light,bangbang" ;;
+esac
+
+# ── Send ──────────────────────────────────────────────────────────────────
+body="$suppressed_prefix$(cat "$body_file")"
+http_status="$(
+    curl -s -o /dev/null -w '%{http_code}' \
+        -H "Title: $subject" \
+        -H "Priority: $ntfy_priority" \
+        -H "Tags: $tags" \
+        --data-binary "$body" \
+        "$NTFY_SERVER/$NTFY_TOPIC"
+)"
+curl_rc=$?
+
+inc_count "$sent_file"
+
+if [ "$curl_rc" -ne 0 ]; then
+    log "curl failed (exit $curl_rc) sending: [$priority] $subject"
+    exit 1
+fi
+if [ "$http_status" != "200" ]; then
+    log "ntfy returned HTTP $http_status for: [$priority] $subject"
+    exit 1
+fi
+
+log "sent: [$priority] $subject"
+exit 0

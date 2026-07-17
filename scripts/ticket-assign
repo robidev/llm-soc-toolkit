@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# ticket-assign <src-path> <dest-role>
+#
+# The ONE cross-folder ticket-write path (runner-and-permissions.md §4 +
+# §11.2(6)). A narrow, fully deterministic trusted helper: it moves a
+# ticket the caller owns (or one staged in unassigned/) into a
+# destination role folder and chowns it to that role. No LLM, and nothing
+# about WHAT it does depends on ticket content — only on the two args and
+# the calling user's identity (from sudo, not a claimed argument).
+#
+# Runs as root via the sudoers rule in /etc/sudoers.d/soc-ticket-assign.
+# ALL argument safety (path containment, filename shape, dest collision,
+# symlink/TOCTOU) is enforced HERE, not in sudoers (see that file's note).
+#
+set -euo pipefail
+
+SOC_ROOT=/home/user/projects/llm-soc-toolkit   # [SOC-ROOT-PATH]
+TS="$SOC_ROOT/ticketing-system"
+AUDIT="$SOC_ROOT/permission-audit/ticket-assign.log"
+
+# Valid destinations: NOT 'analyst' (system.md: nothing may be assigned to
+# analyst) and NOT 'unassigned' (a source staging area, never a dest).
+DEST_ROLES=" specialist tuner-dev soclead user "
+
+SRC_ARG="${1:-}"; DEST_ROLE="${2:-}"
+
+audit() { # <result-word> <detail>
+  printf '%s user=%s src=%q dest=%q result=%s %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SUDO_USER:-?}" \
+    "$SRC_ARG" "$DEST_ROLE" "$1" "${2:-}" >>"$AUDIT" 2>/dev/null || true
+}
+die() { echo "ticket-assign: $1" >&2; audit REFUSED "reason=$1"; exit 1; }
+
+# --- must be invoked through sudo (root euid + a real invoking user) ---
+[[ $EUID -eq 0 ]]        || die "must run as root (via sudo)"
+[[ -n "${SUDO_USER:-}" ]] || die "must be invoked via sudo (no SUDO_USER)"
+caller="$SUDO_USER"
+
+# --- arity ---
+[[ $# -eq 2 ]] || die "usage: ticket-assign <src-path> <dest-role>"
+
+# --- dest-role must be exactly one of the allowlist ---
+[[ "$DEST_ROLES" == *" $DEST_ROLE "* ]] || die "invalid dest-role: $DEST_ROLE"
+
+# --- map calling user -> its own folder (or none for soc-infra) ---
+case "$caller" in
+  soc-analyst)    own="analyst"    ;;
+  soc-specialist) own="specialist" ;;
+  soc-tunerdev)   own="tuner-dev"  ;;
+  soc-soclead)    own="soclead"    ;;
+  soc-infra)      own=""           ;;  # helper account: no own queue, may only source from unassigned/
+  *)              die "caller not a recognized role account: $caller" ;;
+esac
+
+# --- canonicalize allowed source roots + the source itself (resolves ..
+#     and every symlink; -e requires existence, so nothing is created) ---
+unassigned_root="$(realpath -e -- "$TS/unassigned" 2>/dev/null)" || die "unassigned/ missing"
+own_root=""
+[[ -n "$own" ]] && { own_root="$(realpath -e -- "$TS/$own" 2>/dev/null)" || die "own folder missing"; }
+src="$(realpath -e -- "$SRC_ARG" 2>/dev/null)" || die "source not found: $SRC_ARG"
+
+# --- containment: the RESOLVED file's parent dir must EXACTLY equal an
+#     allowed root (exact match, not prefix — defeats sibling-prefix and
+#     symlink-out-of-tree tricks; tickets are flat files in the folder) ---
+srcdir="$(dirname -- "$src")"
+if [[ "$srcdir" != "$unassigned_root" && ( -z "$own_root" || "$srcdir" != "$own_root" ) ]]; then
+  die "source not in unassigned/ or caller's own folder"
+fi
+
+# --- filename shape (also blocks metachar/arg-injection basenames) ---
+base="$(basename -- "$src")"
+[[ "$base" =~ ^(CLOSED_)?[0-9]{8}T[0-9]{6}\.[0-9]+_[a-z0-9-]+\.md$ ]] \
+  || die "source is not a valid ticket filename: $base"
+
+# --- source must be a real regular file, not a symlink ---
+[[ -f "$src" && ! -L "$src" ]] || die "source is not a regular file"
+
+# --- destination ---
+destdir="$(realpath -e -- "$TS/$DEST_ROLE" 2>/dev/null)" || die "dest folder missing: $DEST_ROLE"
+dest="$destdir/$base"
+[[ -e "$dest" ]] && die "destination already exists (refusing to overwrite): $DEST_ROLE/$base"
+
+# --- move (no-clobber) then verify the move actually happened as intended:
+#     source gone, dest is a real regular file (not a symlink slipped in by
+#     a swap race). mv -n backstops a same-name race; the source-gone check
+#     turns a silent -n skip into a hard failure. ---
+mv -n -- "$src" "$dest"
+if [[ -L "$dest" ]]; then rm -f -- "$dest"; die "move produced a symlink (source swapped); aborted"; fi
+[[ ! -e "$src" && -f "$dest" ]] || die "move did not complete cleanly (race?); left as-is"
+
+# --- chown to the destination role + reset mode. Owner per folder:
+#     'user/' is the human inbox (operator-owned); role folders -> soc-<role>.
+case "$DEST_ROLE" in
+  user)      destowner="user"           ;;
+  specialist) destowner="soc-specialist" ;;
+  tuner-dev)  destowner="soc-tunerdev"   ;;
+  soclead)    destowner="soc-soclead"    ;;
+esac
+chown -h -- "$destowner:socroles" "$dest"
+chmod 640 -- "$dest"
+
+audit OK "from=$srcdir owner=$destowner"
+echo "ticket-assign: moved $base -> $DEST_ROLE/ (owner $destowner)"

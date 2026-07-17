@@ -1,0 +1,13 @@
+[Unit]
+Description=LLM-based SOC - Soclead Weekly Trend Report Timer
+
+[Timer]
+# Sunday 03:00 -- one hour clear of soc-soclead-nightly.timer (never the
+# same lock at the same time) and a natural end-of-week boundary for the
+# 7-day trend window.
+OnCalendar=Sun *-*-* 03:00:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

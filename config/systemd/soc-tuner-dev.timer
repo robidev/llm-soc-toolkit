@@ -1,0 +1,18 @@
+[Unit]
+Description=LLM-based SOC - Tuner-dev Role Run Timer
+
+[Timer]
+# Plan's original cadence (soc-structure/overall.md): every 5 hours.
+# Offset resolved 2026-07-16 alongside soc-specialist.timer's: runs at
+# :40 past the hour -- 20min after specialist's :20, 40min after
+# analyst's top-of-hour :00 -- same every-5h cadence (hours 0,5,10,...),
+# just shifted off the whole-hour mark. NOT enabled yet -- see
+# soc-specialist.timer's comment; tuner-dev still waits on step 3 (after
+# specialist has run cleanly for 2-3 days), this only settles its offset
+# ahead of time.
+OnCalendar=*-*-* 0/5:40:00
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

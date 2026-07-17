@@ -1,0 +1,21 @@
+# Controls whether scripts/soc-notify actually delivers to ntfy for a
+# given alert "type" tag. See documentation/escalation.md's "Wrapper
+# script" section for the full spec.
+#
+# Only the deterministic backstop scripts pass a type — soc-escalate's
+# permission_gap notification, context-balloon-scan's context_balloon
+# notification. Everything else (role escalations, prompt_drift,
+# agent-watchdog, daily/weekly reports) calls soc-notify without a type
+# and always sends; this file has no effect on those.
+#
+# Setting a type to false does NOT stop ticket filing — the ticket is
+# still written to ticketing-system/user/ as normal either way. It only
+# skips the ntfy push, so nothing pages a phone for it; the ticket queue
+# is still the record of truth.
+#
+# Missing file, missing key, or any value other than exactly `false`
+# means enabled (fail open) — a typo'd or newly-introduced type still
+# notifies rather than silently going dark.
+
+permission_gap = false
+context_balloon = false

@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+#
+# soc-run-role <role> — the base runner (runner-and-permissions.md §5.1 +
+# §5.4 analyst two-pass + §10's prompt-injection mitigations, plus its own
+# base wrapper: PAUSED / spend-cap / timeout / flock / empty-queue gate
+# for specialist+tuner-dev).
+#
+# Runs as ROOT (from a systemd timer for all four roles now; still
+# usable by hand for an out-of-schedule run of any of them) and launches
+# one role's `claude -p` invocation dropped to that role's Unix user
+# inside a hardened transient systemd unit.
+#
+# Two things the invocation carries that §5.1 calls for and were missing:
+#   - --effort: each role runs at its assigned reasoning effort, not the
+#     CLI default (analyst stage0/1=low, stage2=medium; specialist/
+#     tuner-dev=high; soclead=medium).
+#   - auth: an ANTHROPIC_API_KEY (Console) OR a long-lived subscription
+#     token from `claude setup-token` (CLAUDE_CODE_OAUTH_TOKEN). The token
+#     path only works WITHOUT --bare (bare never reads OAuth); see below.
+#   - --bare is MODE-AWARE (see BARE below). --bare "skip hooks", which
+#     would silence the audit-mode hook-check. So --bare is applied only
+#     in enforce mode (where native settings do the enforcing and the
+#     hook is redundant); in audit mode it is omitted so hook-check fires
+#     and logs. Without --bare, CLAUDE.md/auto-memory discovery is
+#     re-enabled — the sandbox
+#     HOME is the role's empty /var/lib/soc/<role> (no .claude), and cwd is
+#     SOC_ROOT which we control, so the practical bleed surface is our own
+#     tree during a controlled dry-run; the max-isolation --bare is back on
+#     exactly when it matters (enforce / production).
+#
+# After every real run this also sweeps ticketing-system/unassigned/ for
+# tickets with a resolvable assigned_to: field and
+# routes them via the unchanged scripts/ticket-assign -- see
+# sweep_unassigned() below. That mv can only succeed from out here, not
+# from inside a role's own sandbox (see runner-and-permissions.md §4).
+#
+# All four roles run from live systemd timers (analyst hourly :00,
+# specialist hourly :20, tuner-dev every 5h :40, soclead nightly/weekly)
+# -- see documentation/running-roles-manually.md for triggering any of
+# them by hand instead.
+#
+# Testing: set CLAUDE_BIN to a stub to exercise the sandbox/controls
+# without spending tokens; pass --print to dump the systemd-run command(s)
+# instead of running them.
+#
+# --watch: for a real by-hand invocation where a human wants to see it
+# happen live. `claude -p` only ever emits its final message to stdout --
+# no flag makes it stream a live tool-call transcript -- so --watch
+# doesn't touch the claude invocation at all. Instead it spawns
+# scripts/soc-transcript -f as a companion follower that tails the run's
+# own session transcript file directly (the same tool already used for
+# after-the-fact replay). Add -v/--verbose alongside --watch to also
+# include the model's thinking blocks (soc-transcript --thinking).
+# Everything else about the run (sandbox, credentials, daily cap, lock,
+# ticket sweep) is identical to a normal invocation -- --watch only
+# changes what's visible, never what runs.
+#
+set -uo pipefail
+
+SOC_ROOT=/home/user/projects/llm-soc-toolkit      # [SOC-ROOT-PATH]
+ETC=/etc/soc
+STATE_DIR=/var/lib/soc/state
+LOCK_DIR=/run/soc
+
+die() { echo "soc-run-role: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "must run as root"
+
+# queue_has_work <role>: does ticketing-system/<role>/ currently own any
+# open ticket? Ownership rule (ticketing-system/system.md): a ticket
+# belongs to whichever folder it currently sits in, and status:closed /
+# the CLOSED_ filename prefix are set atomically in the same edit (system.md
+# "the two can't drift") -- so "any non-CLOSED_ *.md directly in the
+# role's folder" is a cheap, reliable proxy for "has open work" without
+# needing to parse frontmatter. Used to gate specialist/tuner-dev (see
+# call site) so a periodic cron with nothing to do doesn't burn a real
+# high-effort model pass.
+queue_has_work() {
+  local dir="$SOC_ROOT/ticketing-system/$1" f
+  [[ -d "$dir" ]] || return 1
+  while IFS= read -r -d '' f; do
+    [[ "${f##*/}" == CLOSED_* ]] || return 0
+  done < <(find "$dir" -maxdepth 1 -name '*.md' -print0 2>/dev/null)
+  return 1
+}
+
+# ---- Ctrl-C handling. Two separate problems:
+#  1. The actual work runs as a transient systemd unit in ITS OWN
+#     session, reparented to PID 1 -- it is NOT a descendant of this
+#     script's process group, so a terminal SIGINT never reaches it. A
+#     trap is the only way to reach it: on_interrupt asks systemd
+#     directly to stop CUR_UNIT, and separately kills WATCH_PID (the
+#     --watch follower, which likewise never gets a terminal signal and
+#     would otherwise leak as an orphan).
+#  2. A trap alone is not enough, because of a documented bash
+#     behavior: "If bash is waiting for a command to complete and
+#     receives a signal for which a trap has been set, the trap will not
+#     be executed until the command completes" -- i.e. running
+#     "${CMD[@]}" in the foreground (directly, or via `out=$(...)`)
+#     DEFERS the trap until systemd-run itself returns, which only
+#     happens once the unit is already done. Confirmed live: the trap
+#     fired and correctly cleaned up WATCH_PID, but `systemctl stop`
+#     landed after the unit had already run to completion and been
+#     collected ("not loaded"). The fix, applied at every call site
+#     below: background "${CMD[@]}" and `wait "$CMD_PID"` explicitly --
+#     unlike waiting on a foreground command, `wait` on a backgrounded
+#     job IS interrupted immediately by a trapped signal. CUR_UNIT/
+#     WATCH_PID/CMD_PID are set later (build_cmd / start_watch / each
+#     call site) and empty until then, so this trap is a no-op if a
+#     signal arrives before there's anything to stop. ----
+CUR_UNIT=""; WATCH_PID=""; CMD_PID=""
+on_interrupt() {
+  echo "soc-run-role: caught SIG$1, stopping (unit=${CUR_UNIT:-none})..." >&2
+  [[ -n "$WATCH_PID" ]] && kill "$WATCH_PID" 2>/dev/null
+  [[ -n "$CUR_UNIT" ]] && systemctl stop "$CUR_UNIT" 2>/dev/null
+  [[ -n "$CMD_PID" ]] && kill "$CMD_PID" 2>/dev/null
+  exit 130
+}
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
+
+# run_cmd: background "${CMD[@]}" and wait explicitly (see on_interrupt
+# above for why -- a plain foreground wait defers signal delivery).
+# $1 = "capture" to fill $out from stdout (analyst stage0/1's fence
+# parser needs it); anything else runs with stdout passed through.
+# Always sets $rc.
+run_cmd() {
+  if [[ "${1:-}" == capture ]]; then
+    local outf; outf="$(mktemp)"; tmpfiles+=("$outf")
+    "${CMD[@]}" > "$outf" &
+    CMD_PID=$!
+    wait "$CMD_PID"; rc=$?
+    out="$(<"$outf")"; rm -f "$outf"
+  else
+    "${CMD[@]}" &
+    CMD_PID=$!
+    wait "$CMD_PID"; rc=$?
+  fi
+  CMD_PID=""
+}
+
+# unit_stopped_out_of_band <unit>: true (rc 0) iff an EXTERNAL `systemctl
+# stop <unit>` terminated this run's transient unit, as opposed to the
+# wrapped process exiting on its own. This is the analyst stage0/1 fence
+# parser's discriminator between "operator deliberately aborted the run"
+# and "run completed but produced a malformed/absent fence" -- the two look
+# identical to the fence parser (both leave $out with no closing fence), and
+# only the former should skip the fail-open stage2 escalation.
+#
+# Detection is EMPIRICAL, verify this on your own system before relying on
+# it -- do NOT assume the textbook "wait returns 128+signal" behavior:
+# that assumption is FALSE here: `run_cmd`'s `rc` after `wait "$CMD_PID"` cannot
+# tell the two apart, because systemd treats a clean `systemctl stop`
+# (default KillSignal=SIGTERM) as a *successful* stop and `systemd-run
+# --wait` returns rc=0 for it -- byte-for-byte the same rc a normal exit-0
+# completion yields. (A stop that has to escalate to SIGKILL because the
+# process ignored SIGTERM returns rc=1; `systemctl kill -s KILL` returns
+# rc=255; none of these is a stable, unambiguous "aborted" signal, and rc=0
+# actively collides with the must-still-escalate case.) What an out-of-band
+# `systemctl stop` ALWAYS does, and what nothing else does -- not a normal
+# rc=0 completion, not a non-zero exit, not even `systemctl kill` -- is run
+# an explicit stop *job*, which systemd records in the unit's journal as a
+# "Stopping <unit>..." line. That marker is the reliable tell. Scoped to
+# CUR_UNIT (unique per run: soc-run-$role-$$-$RUNSEQ), so it can't pick up a
+# neighbouring run's stop. Reading the journal needs root, which this script
+# already is. Journal lines survive --collect (they're in journald, not the
+# unit object); a couple of retries cover the small window where the
+# "Stopping" line may lag `systemd-run --wait` returning.
+unit_stopped_out_of_band() {
+  local u="$1" i
+  [[ -n "$u" ]] || return 1
+  for i in 1 2 3; do
+    if journalctl -u "$u" --no-pager -o cat 2>/dev/null | grep -qE '^Stopping '; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+# CLAUDE_BIN: must be an absolute path, never a bare command name. It's
+# exec'd by systemd-run *inside* the sandboxed unit using --setenv=PATH
+# ="$ROLE_PATH" (the narrow per-role shim below) -- not root's own PATH
+# or sudo's secure_path -- and ~/.local/bin is deliberately not on that
+# shim (it's what keeps a role from exec-ing arbitrary binaries a human
+# happens to have installed). So a bare "claude" default can never
+# resolve there regardless of how this script itself was invoked; only
+# a full path sidesteps the lookup entirely. Override with CLAUDE_BIN=
+# for a stub during testing (see header).
+if [[ -z "${CLAUDE_BIN:-}" ]]; then
+  for c in /home/user/.local/bin/claude /usr/local/bin/claude; do
+    [[ -x "$c" ]] && { CLAUDE_BIN="$c"; break; }
+  done
+fi
+CLAUDE_BIN="${CLAUDE_BIN:-}"
+[[ -n "$CLAUDE_BIN" ]] || die "claude not found (checked /home/user/.local/bin/claude, /usr/local/bin/claude) -- set CLAUDE_BIN=/path/to/claude"
+[[ -x "$CLAUDE_BIN" ]] || die "CLAUDE_BIN not executable: $CLAUDE_BIN"
+SHIM_PATH="/usr/local/lib/soc/bin:/usr/local/bin:/usr/bin:/bin"
+
+PRINT_ONLY=0
+WATCH=0
+SHOW_THINKING=0
+WEEKLY=0
+role=""
+USAGE="usage: soc-run-role [--print] [--watch [-v|--verbose]] [--weekly] <analyst|specialist|tuner-dev|soclead> (flags may appear in any order; --weekly only with soclead)"
+for a in "$@"; do
+  case "$a" in
+    --print) PRINT_ONLY=1 ;;
+    --watch) WATCH=1 ;;
+    --verbose|-v) SHOW_THINKING=1 ;;
+    --weekly) WEEKLY=1 ;;
+    -*) die "$USAGE" ;;
+    *) [[ -z "$role" ]] || die "$USAGE"; role="$a" ;;
+  esac
+done
+case "$role" in analyst|specialist|tuner-dev|soclead) ;; *) die "$USAGE";; esac
+[[ "$SHOW_THINKING" -eq 1 && "$WATCH" -ne 1 ]] && echo "soc-run-role: WARNING: -v/--verbose has no effect without --watch" >&2
+[[ "$WEEKLY" -eq 1 && "$role" != soclead ]] && die "$USAGE"
+user="soc-${role/tuner-dev/tunerdev}"
+home="/var/lib/soc/${role/tuner-dev/tunerdev}"
+
+# ---- 0.5.2 base controls: PAUSED kill-switch ----
+if [[ -e "$SOC_ROOT/PAUSED" ]]; then echo "soc-run-role: PAUSED present, skipping $role"; exit 0; fi
+
+# ---- flock: skip if the previous run of this role is still going ----
+mkdir -p "$LOCK_DIR"
+exec 9>"$LOCK_DIR/$role.lock"
+if ! flock -n 9; then echo "soc-run-role: $role still running (lock held), skipping"; exit 0; fi
+
+# ---- per-role model / effort / timeout / daily cap ----
+# STAGE2_* are only meaningful for the analyst two-pass (§5.4).
+STAGE2_MODEL=; STAGE2_EFFORT=; STAGE2_TIMEOUT=
+# ROLE_PATH / ROLE_ENV: per-role sandbox PATH override + extra --setenv values
+# (tuner-dev needs the Rust toolchain on PATH and an offline CARGO_HOME to
+# verify code/config changes). Default: the plain shim PATH, no extra env.
+ROLE_PATH="$SHIM_PATH"; ROLE_ENV=()
+case "$role" in
+  analyst)    CAP=200; MODEL=claude-haiku-4-5-20251001; EFFORT=low;    TIMEOUT=300
+              # STAGE2_TIMEOUT is generous for AUDIT runs (nothing blocks, so
+              # Sonnet explores freely and slowly); enforce short-circuits
+              # denied probes and finishes far faster. First audit run timed
+              # out at 600s mid-triage.
+              STAGE2_MODEL=claude-sonnet-5; STAGE2_EFFORT=medium; STAGE2_TIMEOUT=1200 ;;
+  specialist) CAP=48;  MODEL=claude-sonnet-5;           EFFORT=high;   TIMEOUT=600  ;;
+  tuner-dev)  CAP=12;  MODEL=claude-sonnet-5;           EFFORT=high;   TIMEOUT=1800
+              # Rust toolchain on PATH (read-only via /home + ProtectHome) + an
+              # offline, pre-populated CARGO_HOME (provisioned once) so
+              # code/config changes can be verified with
+              # `cargo check`/`cargo test -p`/`cargo run -- --dry-run`.
+              # CARGO_NET_OFFLINE=true means a change can NEVER pull a new crate:
+              # attacker-influenced ticket text cannot introduce a dependency
+              # (build scripts of already-cached, human-reviewed deps still run,
+              # contained by the sandbox -- accepted residual risk, same
+              # category as any other locally-built dependency).
+              ROLE_PATH="/usr/local/lib/soc/rust/bin:$SHIM_PATH"
+              ROLE_ENV=( "CARGO_HOME=$home/.cargo" CARGO_NET_OFFLINE=true ) ;;
+  soclead)    CAP=6;   MODEL=claude-sonnet-5;           EFFORT=medium; TIMEOUT=900  ;;
+esac
+# --weekly bumps soclead to the trend-report variant: high effort, 7-day
+# window instead of 24h, more to read -> longer timeout (matches
+# tuner-dev's high-effort budget rather than nightly's 900s).
+if [[ "$role" == soclead && "$WEEKLY" -eq 1 ]]; then
+  EFFORT=high; TIMEOUT=1800
+fi
+
+# ---- queue gate (specialist/tuner-dev only, real runs only -- see
+#      queue_has_work above). analyst is the ticket *source* (always has
+#      pipeline/alert data to look at) and soclead's report is calendar-
+#      driven, not ticket-driven, so neither is gated here; this is
+#      specifically for the two roles about to move onto periodic cron
+#      with no other demand signal. Placed before the daily-cap block so
+#      a skip never consumes a cap slot -- same "nothing is going to
+#      execute" reasoning --print already uses below. Logs a line to
+#      agent-logs/$role.log even on skip: agent-watchdog only looks at
+#      the last logged line's timestamp to judge staleness, so a silent
+#      skip during a long empty-queue stretch (tuner-dev's cadence/stale
+#      threshold gives up to 11h of that) would eventually read as a dead
+#      cron -- see the closed
+#      user/CLOSED_20260716T020859.353_specialist-zero-logged-runs-cadence-gap.md
+#      ticket for exactly this "role that doesn't log looks dead" failure
+#      mode. ----
+if [[ "$PRINT_ONLY" -ne 1 ]]; then
+  case "$role" in
+    specialist|tuner-dev)
+      if ! queue_has_work "$role"; then
+        ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "$ts soc-run-role role=$role rc=0 run=skip/$CAP queue=empty" \
+          >> "$SOC_ROOT/agent-logs/$role.log" 2>/dev/null || true
+        echo "soc-run-role: $role queue empty (no open tickets in ticketing-system/$role/), skipping"
+        exit 0
+      fi
+      ;;
+  esac
+fi
+
+# ---- daily run cap (one run = one soc-run-role invocation, two-pass or
+#      not). Skipped entirely under --print: nothing is going to execute,
+#      so it must not consume a real cap slot (a `--print` invocation
+#      should never eat into a role's real daily cap). ----
+count=0
+if [[ "$PRINT_ONLY" -ne 1 ]]; then
+  mkdir -p "$STATE_DIR"
+  today="$(date -u +%Y%m%d)"
+  countf="$STATE_DIR/$role.$today.count"
+  count=0; [[ -r "$countf" ]] && read -r count < "$countf" 2>/dev/null
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  if [[ "$count" -ge "$CAP" ]]; then
+    echo "soc-run-role: $role daily cap $CAP reached ($count), skipping"; exit 0
+  fi
+  printf '%s\n' "$((count + 1))" > "$countf"
+fi
+
+# ---- credential (§5.1). Two supported kinds, checked per-role then
+#      shared; injected via a root-only EnvironmentFile so the secret
+#      never lands on any command line / ps output (§10 open-q #4):
+#        1. an API key  -> ANTHROPIC_API_KEY   (Console; works under --bare)
+#        2. a long-lived subscription token from `claude setup-token`
+#           -> CLAUDE_CODE_OAUTH_TOKEN  (NOT read under --bare — see below)
+#      API key wins if both exist (it's the only one usable in enforce). ----
+cred_var=""; cred_file=""
+for f in "$ETC/$role.key" "$ETC/anthropic.key"; do
+  [[ -r "$f" ]] && { cred_var=ANTHROPIC_API_KEY; cred_file="$f"; break; }
+done
+if [[ -z "$cred_var" ]]; then
+  for f in "$ETC/$role.oauth" "$ETC/oauth-token"; do
+    [[ -r "$f" ]] && { cred_var=CLAUDE_CODE_OAUTH_TOKEN; cred_file="$f"; break; }
+  done
+fi
+[[ -n "$cred_var" ]] || die "no credential: need $ETC/anthropic.key (API key) or $ETC/oauth-token (from 'claude setup-token')"
+envf="$(mktemp)"; chmod 600 "$envf"
+anomf=""                                          # set for analyst below
+tmpfiles=("$envf")                                # every entry rm'd on ANY exit path
+trap 'rm -f "${tmpfiles[@]}"' EXIT
+printf '%s=%s\n' "$cred_var" "$(cat "$cred_file")" > "$envf"
+
+# ---- mode-aware --bare (see header): enforce -> --bare (native settings
+#      enforce, hook redundant); audit -> no --bare (hook fires + logs).
+#      BUT --bare never reads an OAuth/subscription token, so if that's the
+#      credential we must drop --bare even in enforce, or auth just fails.
+#      Surfaced loudly: in that combo item-G isolation rests on native
+#      settings + the role's empty HOME alone; an API key restores --bare. ----
+HOOK_MODE=audit
+if [[ -r "$ETC/hook-mode-$role" ]]; then
+  read -r HOOK_MODE < "$ETC/hook-mode-$role" 2>/dev/null
+elif [[ -r "$ETC/hook-mode" ]]; then
+  read -r HOOK_MODE < "$ETC/hook-mode" 2>/dev/null
+fi
+case "$HOOK_MODE" in enforce) BARE=( --bare ) ;; *) BARE=() ;; esac
+if [[ "$cred_var" == CLAUDE_CODE_OAUTH_TOKEN && ${#BARE[@]} -gt 0 ]]; then
+  echo "soc-run-role: WARNING: subscription token is not read under --bare; dropping --bare for enforce. Use an ANTHROPIC_API_KEY for full --bare isolation in production." >&2
+  BARE=()
+fi
+
+# ---- per-role writable paths + extra add-dir ----
+# $SOC_ROOT/.notify-count is shared (not per-role) because every role can
+# call soc-notify at some priority (escalation.md's role table) and its
+# rate-limit bookkeeping write (scripts/soc-notify's inc_count) needs to
+# succeed from inside whichever role's sandbox is calling it, not just
+# the delivery itself — see ticketing-system/user/
+# 20260711T085700.000_notify-count-read-only-recurrence.md.
+rw=( "$home" "$SOC_ROOT/agent-logs" "$SOC_ROOT/permission-audit" "$SOC_ROOT/ticketing-system/unassigned" "$SOC_ROOT/.notify-count" )
+add_dirs=( "$SOC_ROOT" )
+case "$role" in
+  # $ALERTS/ack.jsonl is the analyst/specialist `siemctl alerts ack` watermark
+  # store — it lives on the (rw) root but ProtectSystem=strict makes it read-only
+  # unless listed here. The
+  # alert-data subdirs (correlated/, <year>/) are user:user, so Unix perms remain
+  # a second layer: the role can only append its own ack.jsonl, not touch alerts.
+  analyst)    rw+=( "$SOC_ROOT/ticketing-system/analyst" "/var/lib/headless-siem/alerts" ) ;;
+  specialist) rw+=( "$SOC_ROOT/ticketing-system/specialist" "/var/lib/headless-siem/alerts" ) ;;
+  soclead)    rw+=( "$SOC_ROOT/ticketing-system/soclead" "$SOC_ROOT/reports" ) ;;
+  # $SOC_ROOT/runbook-drafts: tuner-dev can't write
+  # runbooks/** itself (deliberate human-authorship gate, prompts/
+  # tuner-dev.md), but it can now draft a proposed runbook file's full
+  # content here for the operator to `diff runbooks/X.md
+  # runbook-drafts/X.md` and merge by hand -- manifest Read/Edit grants
+  # this path to tuner-dev only, not the other 3 roles, so an unreviewed
+  # draft never bleeds into analyst/specialist's blanket Read(runbooks/**).
+  tuner-dev)  rw+=( "$SOC_ROOT/ticketing-system/tuner-dev" "$SOC_ROOT/ticketing-system/user" "$home/headless-siem" "$SOC_ROOT/runbook-drafts" )
+              add_dirs+=( "$home/headless-siem" ) ;;
+esac
+
+# ---- shared, per-run-invariant hardening properties ----
+# RuntimeMaxSec is NOT here: it varies per call (stage0/1 vs stage2), so
+# build_cmd adds it from CUR_TIMEOUT.
+props=(
+  --property=ProtectSystem=strict          # whole FS read-only except ReadWritePaths
+  --property=ProtectHome=read-only         # /home readable, not writable
+  --property=PrivateTmp=yes                 # per-run /tmp; subsumes §5.4 temp-file cleanup for /tmp
+  # NoNewPrivileges=yes deliberately OMITTED: it structurally cannot
+  # coexist with sudo (the kernel's PR_SET_NO_NEW_PRIVS is inherited by
+  # every descendant process, including sudo itself, which needs setuid
+  # escalation to function) -- setting it breaks ticket-assign/
+  # soc-notify-high-critical/soc-restart-pipeline unconditionally, in both
+  # audit and enforce mode. The sudoers rules themselves stay
+  # narrowly argument-scoped (RestrictSUIDSGID below, ticket-assign's own
+  # arg validation, soc-notify's fixed script path) -- that's the actual
+  # boundary; NoNewPrivileges' marginal extra protection was against an
+  # unrelated, unsanctioned setuid binary, not the paths this design uses.
+  --property=RestrictSUIDSGID=yes
+  --property=ProtectControlGroups=yes
+  --property=ProtectKernelTunables=yes
+  --property="EnvironmentFile=$envf"
+)
+for p in "${rw[@]}"; do props+=( --property="ReadWritePaths=$p" ); done
+
+# build_cmd: populate global CMD[] for one hardened invocation.
+#   $1 model  $2 effort  $3 prompt-FILE  $4 extra --setenv (name=val, or "")
+#   $5 stage tag ("stage2" adds the private-handoff dir to --add-dir)
+# The role instructions are loaded from a FILE via --append-system-prompt-file
+# so they never land on the command line / `ps` output (only the path shows);
+# just a short fixed user turn is passed with -p. reads CUR_TIMEOUT for this
+# call's RuntimeMaxSec.
+USER_TURN="Begin your scheduled run now, following your system instructions."
+RUNSEQ=0
+build_cmd() {
+  RUNSEQ=$((RUNSEQ + 1))
+  CUR_UNIT="soc-run-$role-$$-$RUNSEQ"          # read by on_interrupt (trap, above)
+  CMD=( systemd-run --uid="$user" --gid=socroles --pipe --wait --collect --quiet
+        --working-directory="$SOC_ROOT"
+        --unit="$CUR_UNIT"
+        "${props[@]}"
+        --property="RuntimeMaxSec=$CUR_TIMEOUT"
+        --setenv=HOME="$home"
+        --setenv=PATH="$ROLE_PATH"
+        --setenv=CLAUDE_ROLE="$role" )
+  [[ -n "$4" ]] && CMD+=( --setenv="$4" )
+  local e; for e in "${ROLE_ENV[@]}"; do CMD+=( --setenv="$e" ); done
+  CMD+=( "${BARE[@]}"
+         -- "$CLAUDE_BIN" --append-system-prompt-file "$3" -p "$USER_TURN"
+            --model "$1" --effort "$2" --settings "$ETC/$role-settings.json" )
+  local d; for d in "${add_dirs[@]}"; do CMD+=( --add-dir "$d" ); done
+  [[ "${5:-}" == stage2 ]] && CMD+=( --add-dir "$home/tmp" )
+}
+
+# ---- WATCH: start_watch/stop_watch bracket one claude invocation.
+# start_watch snapshots whatever session file is currently newest for
+# this role, then backgrounds a poll loop that waits for a DIFFERENT
+# (i.e. genuinely new) session file to appear before exec-ing into
+# `soc-transcript -f` -- starting the follower immediately, against
+# whatever was already newest, would instead replay a stale prior
+# session from the top before ever noticing this run's own. 200 * 0.3s
+# = 60s cap so a follower can never outlive a role that fails to start.
+# stop_watch gives the follower's own ~1s poll one more cycle to pick up
+# trailing lines before killing it (SIGTERM; soc-transcript has no
+# handler for it, so it just exits quietly, same as Ctrl-C). WATCH_PID
+# itself is declared up top (with CUR_UNIT) so on_interrupt can reach it. ----
+start_watch() {
+  local pdir pre_newest thinking_flag
+  pdir="$(compgen -G "$home/.claude/projects/*" | head -1)"
+  pre_newest=""
+  [[ -n "$pdir" ]] && pre_newest="$(ls -t "$pdir"/*.jsonl 2>/dev/null | head -1)"
+  thinking_flag=(); [[ "$SHOW_THINKING" -eq 1 ]] && thinking_flag=( --thinking )
+  (
+    local waited=0 p newest=""
+    while [[ $waited -lt 200 ]]; do
+      p="$(compgen -G "$home/.claude/projects/*" | head -1)"
+      if [[ -n "$p" ]]; then
+        newest="$(ls -t "$p"/*.jsonl 2>/dev/null | head -1)"
+        [[ -n "$newest" && "$newest" != "$pre_newest" ]] && break
+      fi
+      sleep 0.3; waited=$((waited + 1))
+    done
+    exec "$SOC_ROOT/scripts/soc-transcript" "$role" -f "${thinking_flag[@]}"
+  ) &
+  WATCH_PID=$!
+}
+stop_watch() {
+  [[ -n "$WATCH_PID" ]] || return 0
+  sleep 1.5
+  kill "$WATCH_PID" 2>/dev/null
+  wait "$WATCH_PID" 2>/dev/null
+  WATCH_PID=""
+}
+
+log_run() {  # $1 rc  $2 extra note fields
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "$ts soc-run-role role=$role rc=$1 run=$((count + 1))/$CAP $2" \
+    >> "$SOC_ROOT/agent-logs/$role.log" 2>/dev/null || true
+
+  # Backstop for a role process that exits non-zero without ever logging
+  # its own "role=$role result=..." line -- e.g. a role run that dies
+  # mid-turn leaves that hour's triage completely unrecorded with no
+  # result= line at all, and agent-watchdog only checks the *last* line's
+  # staleness, so a single silent gap like this would otherwise be invisible.
+  # PRE_LOG_LINES is set by the caller immediately before its own run_cmd
+  # (one snapshot per claude invocation -- stage0/1, stage2, and the
+  # single-pass roles each set it fresh, so this only ever looks at lines
+  # THIS invocation could have written, never a stale result= line from an
+  # earlier stage/run). Only fires on a real failure with no matching
+  # result= line among those new lines -- a clean rc=0 run, or a failed one
+  # that already logged its result before crashing, gets no synthetic line.
+  if [[ "$1" != 0 ]]; then
+    local added
+    added="$(tail -n "+$((${PRE_LOG_LINES:-0} + 1))" "$SOC_ROOT/agent-logs/$role.log" 2>/dev/null)"
+    if ! grep -q "role=$role result=" <<< "$added"; then
+      echo "$ts role=$role result=error notes=\"soc-run-role: process exited rc=$1 with no result= line logged by the role itself (synthetic, see log_run)\"" \
+        >> "$SOC_ROOT/agent-logs/$role.log" 2>/dev/null || true
+    fi
+  fi
+}
+
+# Line count of this role's agent-logs before a claude invocation starts --
+# log_run (above) diffs against this to tell whether the invocation logged
+# its own result= line. Set fresh immediately before every run_cmd call
+# that feeds into a log_run call (see call sites below).
+role_log_lines() { wc -l < "$SOC_ROOT/agent-logs/$role.log" 2>/dev/null || echo 0; }
+
+# ---- Drain unassigned/ of any ticket with a resolvable
+#      assigned_to: field. Runs HERE (root, no sandbox) because the actual
+#      privileged mv+chown (scripts/ticket-assign, unchanged) can no longer
+#      succeed from inside a role's own ProtectSystem=strict mount namespace
+#      -- sudo doesn't create a new one, so the calling role's read-only
+#      binds still apply even as root. Safe to call after every run
+#      regardless of which role just ran or whether it succeeded; the sweep
+#      is idempotent and state-scan-based, not run-scoped. ----
+sweep_unassigned() {
+  python3 "$SOC_ROOT/scripts/ticket-route-sweep" || echo "soc-run-role: WARNING: ticket-route-sweep failed (rc=$?)" >&2
+}
+
+# ---- Shared cadence gate for the three periodic root-run checks (heal-permissions
+#      --all cross-role sweep, context-balloon-scan, soc-escalate) -- all do
+#      real cross-role I/O (ticket filing, notify), so they run on a
+#      timer, not on literally every analyst tick (every 10 min). Gate is a
+#      plain mtime check on .escalation-state/.last-periodic-run (soc-escalate's
+#      own state dir); best-effort throughout, same non-blocking pattern as
+#      sync_tunerdev_master/heal_permissions above. PERIODIC_MINUTES=60 is a
+#      starting value -- tune it against your own cron volume once you
+#      have real traffic to judge by. ----
+PERIODIC_MINUTES=60
+PERIODIC_STATE="$SOC_ROOT/.escalation-state/.last-periodic-run"
+run_periodic_maintenance() {
+  local now last_mtime age_min
+  now="$(date +%s)"
+  last_mtime=0
+  [[ -f "$PERIODIC_STATE" ]] && last_mtime="$(stat -c '%Y' "$PERIODIC_STATE" 2>/dev/null || echo 0)"
+  age_min=$(( (now - last_mtime) / 60 ))
+  [[ "$age_min" -lt "$PERIODIC_MINUTES" ]] && return 0
+
+  mkdir -p "$(dirname "$PERIODIC_STATE")"
+  python3 "$SOC_ROOT/scripts/heal-permissions" --all \
+    || echo "soc-run-role: WARNING: heal-permissions --all failed" >&2
+  "$SOC_ROOT/scripts/context-balloon-scan" \
+    || echo "soc-run-role: WARNING: context-balloon-scan failed" >&2
+  "$SOC_ROOT/scripts/soc-escalate" \
+    || echo "soc-run-role: WARNING: soc-escalate failed" >&2
+
+  touch "$PERIODIC_STATE"
+  chown soc-infra:socroles "$PERIODIC_STATE" 2>/dev/null || true
+  chmod 640 "$PERIODIC_STATE" 2>/dev/null || true
+}
+
+# ---- keep tuner-dev's isolated worktree's local "master" ref current.
+#      soc-tunerdev can never move it itself (root-owned refs/heads/master
+#      inside a root-owned sticky refs/heads/ dir -- provision/
+#      03-tunerdev-checkout.sh's "read-only master" hard-layer design), so
+#      without an outside-the-sandbox refresh it just goes stale forever
+#      after the one-time clone -- a stale master can make tuner-dev
+#      reason off out-of-date state, e.g. concluding an already-merged fix
+#      is still unmerged. Runs HERE (root, no sandbox) for the
+#      same reason sweep_unassigned does -- root is the only account that
+#      can write this ref. Best-effort: a fetch failure (offline, source
+#      repo unavailable) warns but must not block the run. ----
+sync_tunerdev_master() {
+  local repo="/var/lib/soc/tunerdev/headless-siem"
+  # Deliberately uses "branch -f" here, not "update-ref", even though
+  # "branch -f" refuses to force-move the currently checked-out branch --
+  # that refusal exists precisely to prevent the failure mode below.
+  # update-ref would move the ref
+  # without touching the index/working tree, so once master is the
+  # checked-out branch (the common case between tuner-dev runs), each fetch
+  # silently advanced HEAD's target while the working tree/index stayed on
+  # the old commit -- the next "git status" reports the *old* content as
+  # staged for commit (a reverse diff of every commit landed on origin/master
+  # since the last real checkout), indistinguishable at a glance from a
+  # deliberate rollback. Fixed: reset --hard when master is checked out
+  # (safe -- tuner-dev never commits directly to master, always branches
+  # off it first, so there is never real work on master to lose), branch -f
+  # otherwise (the normal, safe case "update-ref" was worked around for).
+  git -C "$repo" fetch origin --quiet 2>/dev/null || {
+    echo "soc-run-role: WARNING: tuner-dev master sync failed (fetch)" >&2
+    return
+  }
+  if [[ "$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null)" == "master" ]]; then
+    git -C "$repo" reset --hard origin/master >/dev/null 2>&1 \
+      || echo "soc-run-role: WARNING: tuner-dev master sync failed (reset --hard)" >&2
+  else
+    git -C "$repo" branch -f master origin/master >/dev/null 2>&1 \
+      || echo "soc-run-role: WARNING: tuner-dev master sync failed (branch -f)" >&2
+  fi
+}
+
+# ---- re-assert per-role file ownership/mode before every run: backstop
+#      against permission drift (already seen 3x by hand) on agent-logs/
+#      permission-audit/ticketing-system files + the shared
+#      .notify-count/.watchdog-state state. Best-effort, non-blocking --
+#      same pattern as sync_tunerdev_master above. Runs HERE (root, no
+#      sandbox) since a role's own sandbox can't chown files it doesn't
+#      already own. ----
+heal_permissions() {  # <role>
+  python3 "$SOC_ROOT/scripts/heal-permissions" "$1" \
+    || echo "soc-run-role: WARNING: heal-permissions failed for $1" >&2
+}
+
+# §5.4 fence parser. Single-quoted so the ``` and \s in the regex stay
+# literal; contains no single quote itself. Reads model stdout, writes the
+# anomaly list to argv[1] on GO/GO-FALLBACK. See caller for the fail-open
+# rationale. Prints one of GO / GO-FALLBACK / STOP -- FALLBACK is its own
+# state (not lumped into GO) specifically so log_run can record fence
+# health deterministically instead of relying on
+# Stage 2 noticing and self-reporting it, which it won't always do.
+PARSE_PY='import sys, json, re
+raw = sys.stdin.read(); out = sys.argv[1]
+m = re.search(r"```anomaly-status\s*\n(.*?)```", raw, re.S)
+obj = None
+if m:
+    try: obj = json.loads(m.group(1))
+    except Exception: obj = None
+if obj is None:
+    # Fail OPEN: spending a Sonnet call beats silently dropping an
+    # anomaly. Attach the raw Stage 0/1 final message (last 2000 chars,
+    # in case the verdict is near the end) so Stage 2 has a starting
+    # point instead of blind-re-deriving the whole window from scratch --
+    # this was the malformed-fence tickets own suggested mitigation.
+    excerpt = raw.strip()[-2000:]
+    with open(out, "w") as f:
+        json.dump({"anomalies": ["Stage 0/1 produced no parseable anomaly-status fence; "
+                                 "re-triage this window to confirm nothing was missed "
+                                 "(cross-check against, do not just trust, the raw text "
+                                 "below) and file a bug to tuner-dev noting the malformed "
+                                 "fence. The raw Stage 0/1 final message was:\n" + excerpt]}, f)
+    print("GO-FALLBACK"); sys.exit(0)
+if obj.get("stage0_stopped") is True:
+    print("STOP"); sys.exit(0)
+anoms = obj.get("anomalies") or []
+if not isinstance(anoms, list) or len(anoms) == 0:
+    print("STOP"); sys.exit(0)
+with open(out, "w") as f:
+    json.dump({"anomalies": anoms}, f)
+print("GO")'
+
+# heal-permissions runs unconditionally, once, before the analyst vs.
+# other-roles branch split below -- one call site covers both flows
+# (home/role are already resolved by here).
+heal_permissions "$role"
+
+# =====================================================================
+# analyst: §5.4 two-pass (Haiku stage0/1 -> optional Sonnet stage2)
+# =====================================================================
+if [[ "$role" == analyst ]]; then
+  # roles have no per-user group (--no-user-group), so group=socroles; the
+  # 700 dir / 600 file keep the §5.4 handoff private regardless of group.
+  install -d -o "$user" -g socroles -m 700 "$home/tmp"
+  # reaper backstop for a wrapper that died before its own trap ran (prompt
+  # .md handoffs as well as the .json anomaly file)
+  find "$home/tmp" -maxdepth 1 -type f \( -name '*.json' -o -name '*.md' \) -mmin +60 -delete 2>/dev/null || true
+  # analyst has no rm grant of its own, so its model-writable scratch space
+  # (prompts/analyst.md's scratch-*.json redirect target, plus the older
+  # notify-body-*.txt staging for soc-notify high/critical) is never
+  # self-cleaned and would otherwise accumulate indefinitely. Same reaper
+  # shape as $home/tmp above -- runs before this run's own files exist, so
+  # it only ever reaps a prior run's leftovers, never the current one.
+  find "$SOC_ROOT/ticketing-system/analyst" -maxdepth 1 -type f \( -name 'scratch-*.json' -o -name 'notify-body-*.txt' \) -mmin +60 -delete 2>/dev/null || true
+  runid="$(date -u +%Y%m%dT%H%M%S)-$$"
+  anomf="$home/tmp/anom.$runid.json"; tmpfiles+=("$anomf")
+
+  # Concatenate brain + stage envelope into per-run files loaded off-argv via
+  # --append-system-prompt-file (--append-system-prompt-file is not cumulative,
+  # so two flags won't work — one combined file per stage). Role-owned 600.
+  p01f="$home/tmp/prompt-stage01.$runid.md"
+  p2f="$home/tmp/prompt-stage2.$runid.md"
+  tmpfiles+=("$p01f" "$p2f")
+  cat "$SOC_ROOT/prompts/analyst.md" "$SOC_ROOT/prompts/analyst-stage01.md" > "$p01f"
+  cat "$SOC_ROOT/prompts/analyst.md" "$SOC_ROOT/prompts/analyst-stage2.md"  > "$p2f"
+  chown "$user:socroles" "$p01f" "$p2f"; chmod 600 "$p01f" "$p2f"
+
+  CUR_TIMEOUT="$TIMEOUT"
+  build_cmd "$MODEL" "$EFFORT" "$p01f" "" ""
+  if [[ "$PRINT_ONLY" -eq 1 ]]; then
+    echo "# stage 0/1 (haiku/$EFFORT):"; printf '%q ' "${CMD[@]}"; echo
+    CUR_TIMEOUT="$STAGE2_TIMEOUT"
+    build_cmd "$STAGE2_MODEL" "$STAGE2_EFFORT" "$p2f" "SOC_ANOMALY_FILE=$anomf" stage2
+    echo "# stage 2 (sonnet/$STAGE2_EFFORT, only if stage0/1 reports anomalies):"
+    printf '%q ' "${CMD[@]}"; echo
+    exit 0
+  fi
+
+  PRE_LOG_LINES="$(role_log_lines)"
+  [[ "$WATCH" -eq 1 ]] && start_watch
+  run_cmd capture
+  [[ "$WATCH" -eq 1 ]] && stop_watch
+  printf '%s\n' "$out"                             # surface stage0/1 output
+
+  # Parse the fenced anomaly-status block deterministically (no LLM).
+  # -> prints STOP, GO, or GO-FALLBACK; on either GO* writes the anomalies
+  # to $anomf. An unparseable/absent fence fails OPEN (GO-FALLBACK with a
+  # re-triage instruction): for a SOC, spending a Sonnet call beats
+  # silently dropping an anomaly. GO-FALLBACK is logged distinctly (not
+  # lumped into GO) so fence health is countable without relying on
+  # Stage 2 noticing and self-reporting it.
+  # NOTE: passed via `python3 -c "$PARSE_PY"` (NOT `python3 - <<HEREDOC`) so
+  # the model output on stdin isn't shadowed by the program on stdin.
+  decision="$(printf '%s' "$out" | python3 -c "$PARSE_PY" "$anomf")"
+
+  if [[ "$decision" == STOP ]]; then
+    log_run "$rc" "model=$MODEL stage2=no fence=ok"
+    sweep_unassigned
+    run_periodic_maintenance
+    exit "$rc"
+  fi
+
+  # ---- out-of-band-stop carve-out (additive; does NOT weaken fail-open) ----
+  # A GO-FALLBACK means "no parseable fence -> fail OPEN and escalate to
+  # Sonnet stage2" -- the right call when a stage0/1 run COMPLETED but emitted
+  # garbage/no fence (a real, confirmed-live Haiku gap;
+  # ticketing-system/user/CLOSED_20260710T222405.849_stage1-malformed-anomaly-fence.md).
+  # But the SAME truncated-output symptom also appears when an operator stops
+  # the stage0/1 unit out-of-band (`systemctl stop $CUR_UNIT` from another
+  # shell) -- NOT via soc-run-role's own Ctrl-C trap, which exits 130 before
+  # ever reaching here. In THAT case escalating to the expensive Sonnet pass
+  # is the opposite of what the operator wanted, and the synthetic anomaly
+  # PARSE_PY wrote ("...malformed fence... file a bug to tuner-dev") is
+  # actively misleading: nothing was malformed, the run was deliberately
+  # killed mid-generation. Detect exactly that case (see
+  # unit_stopped_out_of_band -- journal stop-job marker, since rc can't tell
+  # a clean stop from a normal completion) and skip stage2, logging a THIRD
+  # distinct fence-health value (fence=aborted, alongside ok/malformed) so
+  # the abort is countable and never inflates the malformed-fence rate. The
+  # synthetic $anomf PARSE_PY wrote is simply never consumed (stage2 doesn't
+  # run) and the EXIT trap reaps it. CUR_UNIT is still the stage0/1 unit here
+  # -- the stage2 build_cmd below hasn't overwritten it yet.
+  if [[ "$decision" == GO-FALLBACK ]] && unit_stopped_out_of_band "$CUR_UNIT"; then
+    echo "soc-run-role: stage0/1 unit stopped out-of-band ($CUR_UNIT) -- treating as aborted, NOT escalating to stage2 (not a malformed fence)." >&2
+    log_run "$rc" "model=$MODEL stage2=no fence=aborted"
+    sweep_unassigned
+    run_periodic_maintenance
+    exit "$rc"
+  fi
+
+  fence_note="ok"; [[ "$decision" == GO-FALLBACK ]] && fence_note="malformed"
+
+  # escalate: hand the anomaly list to Sonnet privately.
+  chown "$user:socroles" "$anomf"; chmod 600 "$anomf"
+  CUR_TIMEOUT="$STAGE2_TIMEOUT"
+  build_cmd "$STAGE2_MODEL" "$STAGE2_EFFORT" "$p2f" "SOC_ANOMALY_FILE=$anomf" stage2
+  PRE_LOG_LINES="$(role_log_lines)"
+  [[ "$WATCH" -eq 1 ]] && start_watch
+  run_cmd
+  [[ "$WATCH" -eq 1 ]] && stop_watch
+  log_run "$rc" "model=$MODEL->$STAGE2_MODEL stage2=yes fence=$fence_note"
+  sweep_unassigned
+  run_periodic_maintenance
+  exit "$rc"
+fi
+
+# =====================================================================
+# specialist / tuner-dev / soclead: single hardened pass
+# =====================================================================
+[[ "$role" == tuner-dev ]] && sync_tunerdev_master
+CUR_TIMEOUT="$TIMEOUT"
+PROMPT_FILE="$SOC_ROOT/prompts/$role.md"
+SOCLEAD_MODE=""
+if [[ "$role" == soclead ]]; then
+  # Same brain for both cadences (soc-structure/overall.md) -- concatenate
+  # a small mode envelope so the model knows which of its own Nightly/
+  # Weekly behavior sections applies to THIS invocation, same pattern as
+  # analyst's stage-specific p01f/p2f envelopes above.
+  install -d -o "$user" -g socroles -m 700 "$home/tmp"
+  find "$home/tmp" -maxdepth 1 -type f -name 'prompt-soclead.*.md' -mmin +60 -delete 2>/dev/null || true
+  SOCLEAD_MODE="nightly"; [[ "$WEEKLY" -eq 1 ]] && SOCLEAD_MODE="weekly"
+  # Layer 3 (agent-behavior review): regenerate
+  # the transcript digest right before the weekly prompt is built so
+  # it's always this week's data, never a stale leftover from a prior
+  # run. Root, no-sandbox, same shape as heal_permissions above --
+  # runs unconditionally (even under --print-only, same precedent) since
+  # it's an idempotent side effect, not part of the command being shown.
+  if [[ "$SOCLEAD_MODE" == weekly ]]; then
+    "$SOC_ROOT/scripts/transcript-digest" \
+      || echo "soc-run-role: WARNING: transcript-digest failed" >&2
+  fi
+  runid="$(date -u +%Y%m%dT%H%M%S)-$$"
+  PROMPT_FILE="$home/tmp/prompt-soclead.$runid.md"
+  tmpfiles+=("$PROMPT_FILE")
+  cat "$SOC_ROOT/prompts/soclead.md" "$SOC_ROOT/prompts/soclead-$SOCLEAD_MODE-mode.md" > "$PROMPT_FILE"
+  chown "$user:socroles" "$PROMPT_FILE"; chmod 600 "$PROMPT_FILE"
+fi
+build_cmd "$MODEL" "$EFFORT" "$PROMPT_FILE" "" ""
+if [[ "$PRINT_ONLY" -eq 1 ]]; then printf '%q ' "${CMD[@]}"; echo; exit 0; fi
+PRE_LOG_LINES="$(role_log_lines)"
+[[ "$WATCH" -eq 1 ]] && start_watch
+run_cmd
+[[ "$WATCH" -eq 1 ]] && stop_watch
+note="model=$MODEL"; [[ -n "$SOCLEAD_MODE" ]] && note="$note mode=$SOCLEAD_MODE"
+log_run "$rc" "$note"
+sweep_unassigned
+run_periodic_maintenance
+exit "$rc"

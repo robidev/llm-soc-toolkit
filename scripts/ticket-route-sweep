@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""ticket-route-sweep
+
+Runs as root, from soc-run-role, OUTSIDE any role's sandbox. Drains
+ticketing-system/unassigned/ of any ticket carrying a resolvable
+`assigned_to:` frontmatter field, via the existing, UNCHANGED
+scripts/ticket-assign -- which performs the actual mv+chown, something
+that can no longer succeed from inside a role's own ProtectSystem=strict
+sandbox regardless of sudo (sudo doesn't create a new mount namespace,
+so the calling role's read-only binds still apply).
+
+Idempotent and state-scan-based, not run-scoped: every invocation just
+looks at whatever is currently sitting in unassigned/, so a sweep after
+ANY role's run drains the whole backlog -- no separate queue/state file
+to go stale if a run crashes mid-way; the ticket file itself is the only
+state that matters.
+
+A ticket with no assigned_to (not yet set) is left alone -- a later
+sweep will pick it up once it's set. A ticket with an unresolvable
+assigned_to (typo, or a forbidden destination like `analyst`) is left in
+place and logged here; nothing pages a human for it directly, it's
+surfaced via soclead's existing stale-ticket scan noticing an old file
+sitting in unassigned/.
+"""
+import sys
+import os
+import re
+import subprocess
+import datetime
+
+SOC_ROOT = os.environ.get("SOC_ROOT", "/home/user/projects/llm-soc-toolkit")  # [SOC-ROOT-PATH]; env override for testing, same pattern as soc-build-settings' SOC_ETC
+UNASSIGNED = os.path.join(SOC_ROOT, "ticketing-system", "unassigned")
+TICKET_ASSIGN = os.environ.get("TICKET_ASSIGN", "/usr/local/bin/ticket-assign")
+AUDIT = os.path.join(SOC_ROOT, "permission-audit", "ticket-route-sweep.log")
+
+FNAME_RE = re.compile(r"^\d{8}T\d{6}\.\d+_[a-z0-9-]+\.md$")  # never CLOSED_ in unassigned/
+DEST_ROLES = {"specialist", "tuner-dev", "soclead", "user"}
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def audit(line):
+    try:
+        with open(AUDIT, "a") as f:
+            f.write("%s %s\n" % (now_iso(), line))
+    except OSError:
+        pass
+
+
+def assigned_to_of(path):
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    for line in parts[1].splitlines():
+        line = line.strip()
+        if line.startswith("assigned_to:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("ticket-route-sweep: must run as root")
+    if not os.path.isdir(UNASSIGNED):
+        return
+
+    for base in sorted(os.listdir(UNASSIGNED)):
+        if not FNAME_RE.match(base):
+            continue
+        path = os.path.join(UNASSIGNED, base)
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+
+        assigned_to = assigned_to_of(path)
+        if not assigned_to:
+            continue  # not yet assigned; a later sweep will pick it up
+        if assigned_to not in DEST_ROLES:
+            audit("SKIP %s assigned_to=%r (not a valid destination)" % (base, assigned_to))
+            continue
+
+        # ticket-assign requires EUID 0 (we're already root) + a
+        # recognized SUDO_USER to determine the caller's "own" folder
+        # (see scripts/ticket-assign). soc-infra has no own queue, so it
+        # may only source from unassigned/ -- exactly what this sweep
+        # ever does, matching the same identity every other soc-infra-run
+        # helper in this design uses (see soc-escalate).
+        env = dict(os.environ, SUDO_USER="soc-infra")
+        r = subprocess.run([TICKET_ASSIGN, path, assigned_to], env=env,
+                            capture_output=True, text=True)
+        if r.returncode == 0:
+            audit("OK %s -> %s" % (base, assigned_to))
+        else:
+            audit("FAILED %s -> %s: %s" % (base, assigned_to, (r.stderr or r.stdout).strip()))
+
+
+if __name__ == "__main__":
+    main()

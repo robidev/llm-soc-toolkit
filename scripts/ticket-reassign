@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""ticket-reassign <path> <dest-role>
+
+Unprivileged helper for a role to hand off a ticket it already OWNS
+(sitting in its own folder) to a different role -- closing a gap the
+create-then-assign flow (ticket-route + ticket-route-sweep) doesn't
+cover: that flow only handles brand-new tickets staged in unassigned/,
+not reassigning one the caller already owns. A live tuner-dev run hit
+this directly: it needed to hand two tickets it
+owned off to `user`, and improvised a raw `mv` + manual frontmatter edit
+that was never allow-listed -- harmless under audit mode (logged, not
+blocked) but would fail outright in enforce mode.
+
+Moves the ticket from the caller's own ticketing-system/<role>/ folder
+into ticketing-system/unassigned/ and sets assigned_to: <dest-role> in
+its frontmatter, in one call. No privilege escalation needed: both the
+source (caller's own folder) and destination (unassigned/) are already
+in the caller's own ReadWritePaths (scripts/soc-run-role's rw array).
+Ownership is read from the CLAUDE_ROLE environment variable soc-run-role
+sets for every sandboxed invocation -- not a claimed argument -- so a
+role can only ever reassign a ticket actually sitting in ITS OWN folder.
+Destination validation is the same allowlist ticket-assign/ticket-route
+already enforce.
+
+The trusted sweep (ticket-route-sweep, run outside any sandbox) still
+does the actual cross-folder move via the unchanged ticket-assign --
+this helper only stages the handoff, exactly like a role creating a
+brand-new ticket in unassigned/ already does.
+
+Exit 0 and print "OK: ..." on success. Exit 1 and print a reason
+otherwise. Never edits/moves anything on a validation failure.
+"""
+import sys
+import os
+import re
+
+SOC_ROOT = os.environ.get("SOC_ROOT", "/home/user/projects/llm-soc-toolkit")  # [SOC-ROOT-PATH]; env override for testing
+TS = os.path.join(SOC_ROOT, "ticketing-system")
+UNASSIGNED = os.path.join(TS, "unassigned")
+
+FNAME_RE = re.compile(r"^\d{8}T\d{6}\.\d+_[a-z0-9-]+\.md$")  # never CLOSED_ -- a closed ticket is done, not reassignable
+# Same allowlist ticket-assign/ticket-route enforce -- never 'analyst'
+# (nothing is ever assigned there) and never 'unassigned' (a staging
+# area, not a destination).
+DEST_ROLES = {"specialist", "tuner-dev", "soclead", "user"}
+# Roles that can OWN a ticket in the first place (analyst's own folder
+# is not a real queue -- ticketing-system/system.md -- so it never has
+# anything of its own to reassign).
+OWNING_ROLES = {"specialist", "tuner-dev", "soclead"}
+
+
+def die(msg):
+    print("ticket-reassign: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) != 3:
+        die("usage: ticket-reassign <path> <dest-role>")
+    arg, dest_role = sys.argv[1], sys.argv[2]
+
+    caller = os.environ.get("CLAUDE_ROLE", "")
+    if caller not in OWNING_ROLES:
+        die("CLAUDE_ROLE=%r cannot own/reassign tickets" % caller)
+
+    if dest_role not in DEST_ROLES:
+        die("dest-role=%r is not a valid destination (must be one of: %s)"
+            % (dest_role, ", ".join(sorted(DEST_ROLES))))
+    if dest_role == caller:
+        die("dest-role=%r is the same as the caller's own role" % dest_role)
+
+    base = os.path.basename(arg)
+    if not FNAME_RE.match(base):
+        die("not a valid, reassignable (non-CLOSED) ticket filename: %s" % base)
+
+    own_dir = os.path.join(TS, caller)
+    try:
+        own_real = os.path.realpath(own_dir)
+        src_real = os.path.realpath(arg)
+        unassigned_real = os.path.realpath(UNASSIGNED)
+    except OSError as e:
+        die("cannot resolve path: %s" % e)
+    if os.path.dirname(src_real) != own_real:
+        die("%s is not in your own folder (ticketing-system/%s/)" % (base, caller))
+    if not os.path.isfile(src_real) or os.path.islink(arg):
+        die("not a regular file: %s" % base)
+
+    dest_path = os.path.join(unassigned_real, base)
+    if os.path.exists(dest_path):
+        die("destination already exists in unassigned/ (refusing to overwrite): %s" % base)
+
+    try:
+        with open(src_real) as f:
+            content = f.read()
+    except OSError as e:
+        die("cannot read %s: %s" % (base, e))
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        die("%s doesn't look like a well-formed ticket (no frontmatter)" % base)
+    fm_lines = [l for l in parts[1].splitlines() if not l.strip().startswith("assigned_to:")]
+    fm_lines.append("assigned_to: %s" % dest_role)
+    parts[1] = "\n".join(fm_lines) + "\n"
+    new_content = "---".join(parts)
+
+    # Write the complete new content to a fresh temp file in the
+    # destination directory, atomically rename it into place, and only
+    # THEN remove the original -- if anything fails before the rename,
+    # the original ticket is untouched; if the final removal fails, the
+    # worst case is a harmless duplicate, never data loss/corruption.
+    tmp_path = os.path.join(unassigned_real, ".%s.tmp.%d" % (base, os.getpid()))
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(new_content)
+        os.replace(tmp_path, dest_path)
+    except OSError as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        die("failed to stage %s in unassigned/: %s" % (base, e))
+    try:
+        os.remove(src_real)
+    except OSError as e:
+        print("ticket-reassign: WARNING: staged in unassigned/ but couldn't remove the original "
+              "in %s/ (%s) -- a duplicate exists, remove it manually" % (caller, e), file=sys.stderr)
+
+    print("OK: %s -> assigned_to=%s, staged in unassigned/ (will be routed by the next sweep)"
+          % (base, dest_role))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

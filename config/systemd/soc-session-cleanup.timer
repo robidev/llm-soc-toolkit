@@ -1,0 +1,10 @@
+[Unit]
+Description=LLM-based SOC - Weekly Session Transcript Cleanup Timer
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

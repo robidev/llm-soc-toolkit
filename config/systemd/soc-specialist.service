@@ -1,0 +1,15 @@
+[Unit]
+Description=LLM-based SOC - Specialist Role Run
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/user/projects/llm-soc-toolkit
+ExecStart=/home/user/projects/llm-soc-toolkit/scripts/soc-run-role specialist
+StandardOutput=journal
+StandardError=journal
+
+# Root, unsandboxed: soc-run-role itself drops into a hardened transient
+# systemd-run unit as the soc-specialist user for the actual claude
+# invocation (runner-and-permissions.md SS5.1) -- matches
+# soc-session-cleanup.service's reasoning for no outer sandboxing here.

@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# soc-escalate — deterministic (non-LLM) escalation path for permission
+# gaps (runner-and-permissions.md §8). Sibling to agent-watchdog: part of
+# soc-infra's territory, no model involved, so it can't be suppressed or
+# gamed by whatever got a role to attempt an out-of-manifest tool call in
+# the first place.
+#
+# Required in BOTH hook-mode stages, not just audit tuning — the operator
+# asked for a general escalation path, not only a tuning aid:
+#   audit   ("Stage A"): permission-audit/<role>.log fills with
+#           AUDIT-NOMATCH / AUDIT-DENYMATCH lines that never blocked
+#           anything (hook-check emits "allow" regardless) — this is the
+#           tuning signal the manifests get built from.
+#   enforce ("Stage B"): the same log instead fills with DENY lines that
+#           DID block a real tool call in production — worth a human's
+#           prompt attention, not just eventual tuning.
+#
+# WHY THIS RUNS AS ROOT, NOT AS soc-infra DIRECTLY: permission-audit/
+# <role>.log is role-owned 600 + chattr +a (step 6 hardening, so a
+# compromised role can't tamper with its own audit trail) — group
+# socroles has NO read bit, deliberately, so no other role (soc-infra
+# included) can read another role's audit log by sitting in the same
+# group. Reading it therefore needs root, the same shape as
+# ticket-assign/soc-restart-pipeline needing root for their own
+# elevated operation. This script must be invoked as root — since
+# 2026-07-12 (item A1 below) automatically by soc-run-role's post-run
+# periodic-maintenance gate (at most once per 60 min), or by hand
+# (`sudo scripts/soc-escalate`). It is NOT sudoers-granted to any
+# soc-<role> account, because no
+# LLM role ever needs to invoke it from inside its own sandboxed Bash
+# tool (unlike ticket-assign/soc-notify) — this is an outside-the-loop
+# check run on the roles, not a tool the roles themselves reach for.
+#
+# Filing the ticket directly into ticketing-system/user/ (no ticket-assign
+# needed — that folder is 2770 setgid group-writable to socroles, same
+# "create direct" path every role already uses for e.g. missing_logs
+# tickets, per ticketing-system/system.md) and firing soc-notify as
+# soc-infra (not root) keeps ownership of both artifacts consistent with
+# every other soc-infra-authored ticket/notification.
+#
+# USAGE: soc-escalate (no arguments, must run as root)
+#
+# Checkpointing: a per-role line-count checkpoint in .escalation-state/,
+# same "state file tracks what was already seen" pattern agent-watchdog
+# uses for its own cooldown state. Only genuinely NEW lines since the
+# last run are reported — re-running immediately is a no-op.
+#
+# Also files
+# a SEPARATE `type: prompt_drift` ticket when a single (cmd|file|input)
+# shape repeats >=3x within one batch — a backstop against a *pattern*,
+# not just any new denial. Tracked across runs in .escalation-state/
+# <role>.patterns so a shape recurring run-over-run escalates low ->
+# medium instead of re-filing at low forever.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AUDIT_DIR="$PROJECT_ROOT/permission-audit"
+TICKET_DIR="$PROJECT_ROOT/ticketing-system/user"
+STATE_DIR="$PROJECT_ROOT/.escalation-state"
+SOC_NOTIFY="$SCRIPT_DIR/soc-notify"
+HOOK_MODE_FILE="${HOOK_MODE_FILE:-/etc/soc/hook-mode}"   # env override for testing, same pattern as hook-check's MODE_FILE
+MAX_LINES_IN_TICKET=200   # cap so a very stale checkpoint can't dump 30K of log into a ticket body
+
+log() { echo "[soc-escalate] $*" >&2; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    log "must run as root (reads role-owned 600 permission-audit logs) — try: sudo $0"
+    exit 1
+fi
+
+mkdir -p "$STATE_DIR"
+chown soc-infra:socroles "$STATE_DIR" 2>/dev/null || true
+chmod 770 "$STATE_DIR" 2>/dev/null || true
+
+# Per-role hook-mode-<role> file wins if present (step 10 staged enforce
+# rollout can flip one role at a time), else the shared HOOK_MODE_FILE --
+# same precedence hook-check/soc-run-role use, so all three agree on which
+# mode a given role is actually in during a partial rollout.
+role_hook_mode() {  # <role>
+    local per_role="$(dirname "$HOOK_MODE_FILE")/hook-mode-$1"
+    if [ -f "$per_role" ]; then
+        cat "$per_role" 2>/dev/null || echo audit
+    elif [ -f "$HOOK_MODE_FILE" ]; then
+        cat "$HOOK_MODE_FILE" 2>/dev/null || echo audit
+    else
+        echo audit
+    fi
+}
+
+exit_code=0
+
+for role in analyst specialist tuner-dev soclead; do
+    log_file="$AUDIT_DIR/$role.log"
+    checkpoint_file="$STATE_DIR/$role.checkpoint"
+
+    [ -f "$log_file" ] || continue   # role has never had a tool call audited yet
+
+    hook_mode="$(role_hook_mode "$role")"
+    case "$hook_mode" in
+        enforce) notify_priority="medium" ;;
+        *)       notify_priority="low" ;;
+    esac
+
+    total_lines="$(wc -l < "$log_file" 2>/dev/null || echo 0)"
+    total_lines="${total_lines//[[:space:]]/}"
+    [ -z "$total_lines" ] && total_lines=0
+
+    checkpoint=0
+    if [ -f "$checkpoint_file" ]; then
+        checkpoint="$(cat "$checkpoint_file" 2>/dev/null || echo 0)"
+        case "$checkpoint" in ''|*[!0-9]*) checkpoint=0 ;; esac
+    fi
+    # Defensive: the log is append-only (chattr +a) so it should never
+    # shrink, but if the checkpoint is somehow ahead of reality (state
+    # file corruption, log rotated out from under us) don't underflow —
+    # treat as "nothing new yet" rather than crash on a negative range.
+    if [ "$checkpoint" -gt "$total_lines" ]; then
+        checkpoint=0
+    fi
+
+    new_count=$((total_lines - checkpoint))
+    if [ "$new_count" -le 0 ]; then
+        continue
+    fi
+
+    new_lines_file="$(mktemp)"
+    tail -n "+$((checkpoint + 1))" "$log_file" > "$new_lines_file"
+
+    # Tally verdicts for a quick human-readable summary line (AUDIT-NOMATCH/
+    # AUDIT-DENYMATCH in audit mode; DENY/NOMANIFEST possible in either).
+    summary="$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^verdict=/) {print $i; break}}' "$new_lines_file" \
+        | sort | uniq -c | sort -rn | awk '{printf "%s x%s  ", $2, $1}')"
+
+    # body_file lives under STATE_DIR (soc-infra:socroles 770), not /tmp,
+    # and gets chowned to soc-infra below — soc-notify is invoked as
+    # soc-infra (see runuser call below), which otherwise couldn't read a
+    # root-owned mktemp file in /tmp.
+    body_file="$(mktemp -p "$STATE_DIR")"
+    {
+        echo "Role: $role"
+        echo "Manifest: /etc/soc/manifest-enforced-$role.json"
+        echo "hook-mode: $hook_mode"
+        echo "New entries since last check: $new_count  ($summary)"
+        echo ""
+        echo "Review each entry below: if the role's reach was legitimate, add the"
+        echo "matching allow pattern to the manifest above. If it looks like the role"
+        echo "reaching for something out of scope, leave it denied — that's itself a"
+        echo "useful signal, potentially worth its own investigation (e.g. a"
+        echo "prompt-injection indicator, see runner-and-permissions.md §10)."
+        echo ""
+        if [ "$new_count" -gt "$MAX_LINES_IN_TICKET" ]; then
+            echo "Showing first $((MAX_LINES_IN_TICKET / 2)) and last $((MAX_LINES_IN_TICKET / 2)) of $new_count new lines (full log: permission-audit/$role.log):"
+            echo '```'
+            head -n "$((MAX_LINES_IN_TICKET / 2))" "$new_lines_file"
+            echo "... ($((new_count - MAX_LINES_IN_TICKET)) lines omitted) ..."
+            tail -n "$((MAX_LINES_IN_TICKET / 2))" "$new_lines_file"
+            echo '```'
+        else
+            echo '```'
+            cat "$new_lines_file"
+            echo '```'
+        fi
+    } > "$body_file"
+
+    ts_file="$(date -u +%Y%m%dT%H%M%S.%3N)"
+    ts_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ticket_name="${ts_file}_permission-gap-${role}.md"
+    ticket_path="$TICKET_DIR/$ticket_name"
+
+    {
+        echo "---"
+        echo "issuer: soc-infra"
+        echo "type: permission_gap"
+        echo "priority: $notify_priority"
+        echo "status: open"
+        echo "created: $ts_iso"
+        echo "closed:"
+        echo "---"
+        echo ""
+        echo "## Subject"
+        echo ""
+        echo "permission-audit: $new_count new entr$([ "$new_count" -eq 1 ] && echo y || echo ies) for role $role ($hook_mode mode)"
+        echo ""
+        echo "## Details"
+        echo ""
+        cat "$body_file"
+        echo ""
+        echo "## Comments"
+        echo ""
+        echo "- $ts_iso soc-infra: Filed automatically by scripts/soc-escalate (runner-and-permissions.md §8)."
+    } > "$ticket_path"
+    chown soc-infra:socroles "$ticket_path"
+    chmod 640 "$ticket_path"
+
+    log "filed $ticket_name ($new_count new entries, role=$role)"
+
+    chown soc-infra:socroles "$body_file"
+    chmod 640 "$body_file"
+
+    # Run as soc-infra (not root) so .notify-count/ stays soc-infra-owned,
+    # same as every other soc-notify call site.
+    if runuser -u soc-infra -- "$SOC_NOTIFY" "$notify_priority" "SOC permission gap: $role ($new_count new)" "$body_file" "permission_gap"; then
+        log "notified ($notify_priority): $role"
+    else
+        log "soc-notify failed for $role — ticket $ticket_name still filed, will not re-notify until next new entry"
+        exit_code=1
+    fi
+
+    # Advance the checkpoint once the ticket is durably on disk, regardless
+    # of notify outcome — the ticket itself is the record; notify is a
+    # convenience ping, and re-filing a duplicate ticket for the same lines
+    # on every run (because notify hiccuped) would be worse than a missed
+    # ping.
+    printf '%s' "$total_lines" > "$checkpoint_file"
+    chown soc-infra:socroles "$checkpoint_file" 2>/dev/null || true
+    chmod 640 "$checkpoint_file" 2>/dev/null || true
+
+    # ---- Repeating-pattern detection on top of the any-new-denial ticket
+    # above. A single (cmd|file|input) shape showing up >=3x in THIS batch is
+    # either persistent prompt drift or worth a look as a possible
+    # injection signal (runner-and-permissions.md §10) -- distinct enough
+    # from one-off tuning noise to warrant its own ticket type.
+    detect_denial_patterns() {  # <new_lines_file>
+        awk '{c=""; for(i=1;i<=NF;i++) if ($i ~ /^(cmd|file|input)=/) c=$i}
+             {print c}' "$1" | sort | uniq -c | sort -rn
+    }
+
+    patterns_state="$STATE_DIR/$role.patterns"
+    repeating_shapes="$(detect_denial_patterns "$new_lines_file" \
+        | awk '{cnt=$1; $1=""; sub(/^ /,""); if (cnt+0 >= 3 && $0 != "") print}')"
+
+    if [ -n "$repeating_shapes" ]; then
+        # Recurring across separate runs (not just within this batch)
+        # escalates low -> medium; tracked as a flat set of previously-seen
+        # shapes in $STATE_DIR/$role.patterns, same "state file" convention
+        # as the line-count checkpoint above.
+        pd_priority="low"
+        while IFS= read -r shape; do
+            [ -n "$shape" ] || continue
+            if [ -f "$patterns_state" ] && grep -qxF "$shape" "$patterns_state"; then
+                pd_priority="medium"
+            fi
+        done <<< "$repeating_shapes"
+
+        { [ -f "$patterns_state" ] && cat "$patterns_state"; printf '%s\n' "$repeating_shapes"; } \
+            | sort -u | sed '/^$/d' > "$patterns_state.tmp" && mv "$patterns_state.tmp" "$patterns_state"
+        chown soc-infra:socroles "$patterns_state" 2>/dev/null || true
+        chmod 640 "$patterns_state" 2>/dev/null || true
+
+        pd_body_file="$(mktemp -p "$STATE_DIR")"
+        {
+            echo "Role: $role"
+            echo "hook-mode: $hook_mode"
+            echo "Repeating denial pattern(s) in this batch (count, shape; threshold 3):"
+            echo ""
+            echo '```'
+            printf '%s\n' "$repeating_shapes" | while IFS= read -r s; do
+                [ -n "$s" ] && grep -F "$s" <(detect_denial_patterns "$new_lines_file")
+            done
+            echo '```'
+            echo ""
+            echo "A shape repeating this often within one batch is either persistent"
+            echo "prompt drift (the role keeps reaching for the same out-of-manifest"
+            echo "thing) or worth a look as a possible injection signal"
+            echo "(runner-and-permissions.md §10). Escalates to medium once the same"
+            echo "shape has recurred across separate soc-escalate runs, not just once."
+        } > "$pd_body_file"
+
+        pd_ts_file="$(date -u +%Y%m%dT%H%M%S.%3N)"
+        pd_ts_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        pd_ticket_name="${pd_ts_file}_prompt-drift-${role}.md"
+        pd_ticket_path="$TICKET_DIR/$pd_ticket_name"
+
+        {
+            echo "---"
+            echo "issuer: soc-infra"
+            echo "type: prompt_drift"
+            echo "priority: $pd_priority"
+            echo "status: open"
+            echo "created: $pd_ts_iso"
+            echo "closed:"
+            echo "---"
+            echo ""
+            echo "## Subject"
+            echo ""
+            echo "soc-escalate: repeating denial pattern for role $role ($hook_mode mode)"
+            echo ""
+            echo "## Details"
+            echo ""
+            cat "$pd_body_file"
+            echo ""
+            echo "## Comments"
+            echo ""
+            echo "- $pd_ts_iso soc-infra: Filed automatically by scripts/soc-escalate."
+        } > "$pd_ticket_path"
+        chown soc-infra:socroles "$pd_ticket_path"
+        chmod 640 "$pd_ticket_path"
+
+        log "filed $pd_ticket_name (repeating pattern, role=$role, priority=$pd_priority)"
+
+        chown soc-infra:socroles "$pd_body_file"
+        chmod 640 "$pd_body_file"
+
+        if runuser -u soc-infra -- "$SOC_NOTIFY" "$pd_priority" "SOC prompt drift: $role" "$pd_body_file"; then
+            log "notified ($pd_priority): $role prompt-drift"
+        else
+            log "soc-notify failed for $role prompt-drift ticket — ticket $pd_ticket_name still filed"
+            exit_code=1
+        fi
+
+        rm -f "$pd_body_file"
+    fi
+
+    rm -f "$new_lines_file" "$body_file"
+done
+
+exit "$exit_code"

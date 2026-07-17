@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""soc-build-settings [role...]
+
+Deterministically (re)generates /etc/soc/<role>-settings.json from
+/etc/soc/manifest-enforced-<role>.json + that role's current mode
+(per-role /etc/soc/hook-mode-<role> override if present, else the shared
+/etc/soc/hook-mode) -- runner-and-permissions.md step 10, the "promote
+manifests to native settings" half of the enforce flip.
+
+This is what makes the enforce flip reversible with a single command:
+"revert" is flipping the mode file back to audit and re-running this,
+never a hand-restored backup -- the output is fully determined by the
+manifest + mode, so re-running it is always safe and idempotent.
+
+  sudo soc-build-settings                 # regenerate every role
+  sudo soc-build-settings analyst         # just one (matches whatever
+                                           # mode that role is currently in)
+
+audit mode  : the narrow catastrophic-only native deny list (unchanged
+              shape from Stage A) -- no allow array, no defaultMode, so
+              Claude Code's own permissive non-interactive default lets
+              everything else through. hook-check is what actually
+              observes/logs in this mode; it never blocks.
+enforce mode: the manifest's full allow list + (manifest deny UNION the
+              catastrophic-safety list below, always kept regardless of
+              what any given manifest says) + defaultMode: dontAsk, so
+              anything not explicitly allowed is auto-denied instead of
+              hanging on an interactive prompt nobody's there to answer
+              in a headless run. hook-check remains wired in underneath
+              as defense-in-depth, per runner-and-permissions.md §7.
+
+Writes via temp-file-then-rename (atomic on the same filesystem) so an
+interrupted run never leaves a half-written settings.json behind.
+"""
+import sys, os, json, argparse
+
+ETC = os.environ.get("SOC_ETC", "/etc/soc")  # env override for testing, same pattern as hook-check's MANIFEST_DIR/MODE_FILE
+ROLES = ("analyst", "specialist", "tuner-dev", "soclead")
+
+# Always-on regardless of mode/manifest -- catastrophic safety net,
+# defense-in-depth on top of whatever a given manifest says.
+#
+# "Skill" is here (not just omitted from any manifest's allow list) because
+# omission alone isn't enough: verified 2026-07-12 that a tool merely being
+# absent from the allow list under defaultMode: dontAsk still lets Claude
+# Code's skill-discovery scan run and inject the full skill listing into
+# context (confirmed ~900 extra chars for headless-siem's siemctl skill,
+# reachable from tuner-dev's own add-dir) -- only an explicit deny rule
+# suppresses the listing/discovery itself, verified empirically the same
+# way. No role prompt ever asks a role to invoke a skill.
+SAFETY_DENY = [
+    "Read(documentation/canary-hosts.md)",
+    "Bash(rm -rf /*)",
+    "Bash(rm -rf ~*)",
+    "Skill",
+]
+
+
+def role_mode(role):
+    per_role = os.path.join(ETC, "hook-mode-%s" % role)
+    for path in (per_role, os.path.join(ETC, "hook-mode")):
+        if os.path.isfile(path):
+            try:
+                v = open(path).read().strip()
+                if v:
+                    return v
+            except Exception:
+                pass
+    return "audit"
+
+
+def build(role):
+    mode = role_mode(role)
+    manifest_path = os.path.join(ETC, "manifest-enforced-%s.json" % role)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    man_allow = manifest["permissions"].get("allow", [])
+    man_deny = manifest["permissions"].get("deny", [])
+
+    hooks = {"PreToolUse": [{"hooks": [{"type": "command", "command": "/etc/soc/hook-check", "timeout": 30}]}]}
+
+    if mode == "enforce":
+        deny = list(SAFETY_DENY)
+        for d in man_deny:
+            if d not in deny:
+                deny.append(d)
+        settings = {
+            "_meta": ("Stage B (enforce). Native permissions ARE the primary boundary "
+                      "(promoted from manifest-enforced-%s.json by scripts/soc-build-settings); "
+                      "hook-check is defense-in-depth on top. This file is DERIVED -- "
+                      "re-run soc-build-settings after any manifest edit, never hand-edit it." % role),
+            "permissions": {"defaultMode": "dontAsk", "allow": man_allow, "deny": deny},
+            "hooks": hooks,
+        }
+    else:
+        settings = {
+            "_meta": ("Stage A (audit). hook-check logs out-of-manifest calls, never blocks. "
+                      "Native deny below is the only Stage-A block. Stage B adds the "
+                      "manifest allow/deny + defaultMode dontAsk -- see scripts/soc-build-settings."),
+            "permissions": {"deny": list(SAFETY_DENY)},
+            "hooks": hooks,
+        }
+    return mode, settings
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("roles", nargs="*", choices=ROLES, help="omit for every role")
+    a = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("soc-build-settings: /etc/soc is root-owned -- run with sudo")
+    for role in (a.roles or ROLES):
+        mode, settings = build(role)
+        out_path = os.path.join(ETC, "%s-settings.json" % role)
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp_path, 0o644)
+        os.rename(tmp_path, out_path)
+        print("soc-build-settings: %s -> %s (%s)" % (role, out_path, mode))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(soc-structure/manifests/manifest-enforced-soclead.json)",
+      "Read(scripts/hook-check)",
+      "Read(//etc/soc/hook-mode-soclead)",
+      "Bash(grep *)",
+      "Bash(awk *)",
+      "Bash(sed -n *)",
+      "ToolSearch",
+      "Bash(ticket-route *)",
+      "Bash(ticket-reassign *)",
+      "Bash(ticket-close *)",
+      "Bash(/usr/local/bin/ticket-route *)",
+      "Bash(/usr/local/bin/ticket-reassign *)",
+      "Bash(/usr/local/bin/ticket-close *)",
+      "Bash(/home/user/projects/llm-soc-toolkit/scripts/ticket-route *)",
+      "Bash(/home/user/projects/llm-soc-toolkit/scripts/ticket-reassign *)",
+      "Bash(/home/user/projects/llm-soc-toolkit/scripts/ticket-close *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify low *)",
+      "Read(//var/lib/soc/soclead/.claude/**)",
+      "Edit(//var/lib/soc/soclead/.claude/**)",
+      "Read(ticketing-system/**)",
+      "Read(agent-logs/*.log)",
+      "Read(agent-logs/transcript-digest-weekly.md)",
+      "Read(reports/**)",
+      "Read(//home/user/projects/headless-siem/config/rules/suppress.toml)",
+      "Read(//home/user/projects/headless-siem/docs/detections/**)",
+      "Edit(reports/**)",
+      "Edit(ticketing-system/soclead/**)",
+      "Edit(ticketing-system/unassigned/**)",
+      "Edit(agent-logs/soclead.log)"
+    ],
+    "deny": [
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify medium *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify high *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify critical *)",
+      "Read(documentation/canary-hosts.md)"
+    ]
+  }
+}

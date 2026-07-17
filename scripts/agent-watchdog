@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# agent-watchdog — plain-shell watchdog over the SOC's own agent crons.
+#
+# Deliberately NOT an LLM: if it shared the agents' own failure modes, it
+# couldn't be trusted to notice when an agent has gone silent. Without a
+# script like this, a dead agent cron is only caught by soclead's nightly
+# "role that didn't log" check — up to ~24h blind. This is the same
+# pipeline-silence failure mode Stage 0 (see prompts/analyst.md) already
+# guards against for the SIEM *pipeline* itself, reproduced one layer up
+# to watch the *agents*.
+#
+# What it does: for each role, reads agent-logs/<role>.log's last line
+# and compares its timestamp against that role's expected cadence
+# (~2x cadence plus slack, same heuristic Stage 0 uses). Fires
+# `soc-notify high` for any role that's gone stale.
+#
+# USAGE: agent-watchdog (no arguments)
+#
+# Wired to soc-agent-watchdog.timer (every ~5 min, User=soc-infra) — see
+# config/systemd/soc-agent-watchdog.{service,timer}.
+#
+# Respects the PAUSED kill switch (a paused SOC's silent agents are not
+# an incident — see documentation/escalation.md) and rate-limits its own
+# notifications to at most one per stale role per NOTIFY_COOLDOWN_SECONDS,
+# not one per check, so a watchdog run every few minutes doesn't repage
+# for the same already-known-stale role.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PAUSED_FLAG="$PROJECT_ROOT/PAUSED"
+LOG_DIR="$PROJECT_ROOT/agent-logs"
+STATE_DIR="$PROJECT_ROOT/.watchdog-state"
+SOC_NOTIFY="$SCRIPT_DIR/soc-notify"
+NOTIFY_COOLDOWN_SECONDS=$((4 * 3600))  # re-notify the same stale role at most every 4h
+
+log() { echo "[agent-watchdog] $*" >&2; }
+
+# role -> max staleness in seconds before it's considered dead — roughly
+# ~2x the role's expected cadence plus slack (same heuristic Stage 0 uses
+# for the pipeline itself), except soclead (see its own note below):
+#   analyst      cron hourly          -> stale past ~2.5h (2.5x — adjust
+#     this if you run analyst on a tighter cadence than hourly)
+#   specialist   cron hourly          -> stale past ~2.5h (2.5x)
+#   tuner-dev    cron every 5h        -> stale past ~11h  (2.2x)
+#   soclead      nightly (dominant)   -> stale past ~26h  (1.08x — a
+#     deliberate exception, not the ~2x formula: doubling a ~24h nightly
+#     cadence would mean a 48h blind spot on the SOC's one human-facing
+#     report, which is too long. 26h is cadence-plus-a-couple-hours'
+#     slack instead.)
+declare -A MAX_STALE_SECONDS=(
+    [analyst]=9000
+    [specialist]=9000
+    [tuner-dev]=39600
+    [soclead]=93600
+)
+
+# A paused SOC's silent agents are not an incident — exit quietly,
+# same convention soc-notify itself uses for PAUSED.
+if [ -f "$PAUSED_FLAG" ]; then
+    exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+now_epoch="$(date -u +%s)"
+exit_code=0
+
+for role in analyst specialist tuner-dev soclead; do
+    max_stale="${MAX_STALE_SECONDS[$role]}"
+    log_file="$LOG_DIR/$role.log"
+    state_file="$STATE_DIR/$role.last_notified"
+
+    last_line=""
+    if [ -f "$log_file" ]; then
+        last_line="$(tail -n 1 "$log_file" 2>/dev/null || true)"
+    fi
+
+    if [ -z "$last_line" ]; then
+        # No log line at all (missing or empty file) — treat as
+        # maximally stale rather than skipping the check. In practice
+        # every role has logged for real, so this path is
+        # for a genuinely broken/never-started role, not the normal case.
+        last_epoch=0
+    else
+        last_ts="$(printf '%s\n' "$last_line" | awk '{print $1}')"
+        # Validate the token looks like the ISO 8601 timestamp every
+        # role's log line actually starts with (ticketing-system/system.md
+        # § agent logs) *before* handing it to `date -d`. GNU date doesn't
+        # reliably fail on garbage — e.g. `date -d ""`, `date -d "-"`, or a
+        # bare year all "succeed" into some near-now guess instead of
+        # erroring — so a blank/corrupted last line (exactly the failure
+        # mode this script exists to catch) would otherwise compute as
+        # fresh instead of maximally stale.
+        if [[ "$last_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2} ]]; then
+            last_epoch="$(date -u -d "$last_ts" +%s 2>/dev/null || echo 0)"
+        else
+            last_epoch=0
+        fi
+    fi
+
+    age=$((now_epoch - last_epoch))
+
+    if [ "$age" -le "$max_stale" ]; then
+        # Fresh (or just recovered) — clear any cooldown state so the
+        # *next* staleness notifies right away instead of inheriting an
+        # old cooldown window.
+        rm -f "$state_file"
+        continue
+    fi
+
+    last_notified=0
+    if [ -f "$state_file" ]; then
+        last_notified="$(cat "$state_file" 2>/dev/null || echo 0)"
+    fi
+    case "$last_notified" in ''|*[!0-9]*) last_notified=0 ;; esac
+    # Force base-10 for the same reason scripts/soc-notify's read_count()
+    # does: a stray leading zero in a hand-edited/corrupted state file
+    # (e.g. "008") passes the digit-only check above but would make the
+    # arithmetic below treat it as an invalid octal literal and crash.
+    last_notified=$((10#$last_notified))
+    since_last_notify=$((now_epoch - last_notified))
+
+    if [ "$since_last_notify" -lt "$NOTIFY_COOLDOWN_SECONDS" ]; then
+        log "$role stale (${age}s, cap ${max_stale}s) but within cooldown (last notified ${since_last_notify}s ago) — not re-notifying"
+        continue
+    fi
+
+    body_file="$(mktemp)"
+    {
+        echo "Role: $role"
+        echo "Last log line: ${last_line:-<none — this role has never logged>}"
+        echo "Expected cadence allows staleness up to ${max_stale}s; currently stale for ${age}s."
+        echo "Check agent-logs/$role.log and whatever runs this role's cron."
+    } > "$body_file"
+
+    if "$SOC_NOTIFY" high "SOC agent stale: $role" "$body_file"; then
+        printf '%s' "$now_epoch" > "$state_file"
+        log "notified: $role stale for ${age}s (cap ${max_stale}s)"
+    else
+        log "soc-notify failed while reporting $role stale — will retry next check"
+        exit_code=1
+    fi
+    rm -f "$body_file"
+done
+
+exit "$exit_code"

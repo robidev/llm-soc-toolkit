@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+hook-check — shared PreToolUse hook (runner-and-permissions.md §7, step 6).
+
+Reads a PreToolUse tool call on stdin, checks it against the calling
+role's manifest-enforced-<role>.json, and returns a permission decision.
+
+Contract (verified 2026-07-09 against code.claude.com/docs/en/hooks.md):
+  stdin  : {"tool_name": "...", "tool_input": {...}, "cwd": "...", ...}
+  stdout : {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "allow|deny|defer", "permissionDecisionReason": "..."}}
+  exit 0 : JSON above is honored. (We never exit 2; a deny is expressed in JSON.)
+
+Two modes, from /etc/soc/hook-mode-<role> if present, else the shared
+/etc/soc/hook-mode (default "audit") -- the per-role file exists so the
+step-10 enforce rollout can flip one role at a time and revert one role
+without touching the others (2026-07-10):
+  audit   : never blocks. Allow-matches -> allow. Everything else -> allow,
+            but LOG it to permission-audit/<role>.log as an out-of-manifest
+            call (the tuning signal). Deny-list matches are logged too but
+            still allowed in audit (the narrow catastrophic native deny list
+            is what actually blocks during Stage A; the hook only observes).
+  enforce : deny-match -> deny; allow-match -> allow; else -> deny. All
+            denials logged. Defense-in-depth ON TOP of the native rules,
+            which remain the exact primary boundary (this matcher is
+            best-effort for the pattern shapes we actually use; Stage A
+            tuning validates it before enforce is ever flipped on).
+
+Role is taken from the running UID (soc-<role>), never from input.
+"""
+import json, os, sys, re, fnmatch, pwd, datetime
+
+SOC_ROOT     = "/home/user/projects/llm-soc-toolkit"   # [SOC-ROOT-PATH]
+MANIFEST_DIR = os.environ.get("MANIFEST_DIR", "/etc/soc")
+MODE_FILE    = os.environ.get("HOOK_MODE_FILE", "/etc/soc/hook-mode")
+AUDIT_DIR    = os.environ.get("AUDIT_DIR", os.path.join(SOC_ROOT, "permission-audit"))
+
+# Bash commands Claude Code treats as read-only (subset we rely on); these
+# run without a prompt in CC, so the hook treats them as allowed.
+READONLY = {"ls","cat","echo","pwd","head","tail","grep","wc","which",
+            "diff","stat","du","cd","true","printf","date","sort","uniq","cut","tr","jq"}
+# Process wrappers CC strips before matching.
+WRAPPERS = {"timeout","time","nice","nohup","stdbuf","xargs"}
+
+def split_bash(cmd):
+    """Split a compound command into its pipeline/list segments on the
+    shell separators ; | & && || |& and newlines, but ONLY when they are
+    unquoted and unescaped. A naive regex split breaks on separators that
+    appear inside quoted arguments (e.g. a `;` inside an alert-ack --note,
+    or a `|` inside a grep pattern), mangling legitimate commands into
+    bogus "subcommands" — that produced false NOMATCH/deny verdicts and
+    garbled audit reasons. Over-splitting fails safe (toward deny); this
+    fixes the false positives. Single quotes are literal; inside double
+    quotes a backslash escapes the next char; an unquoted backslash escapes
+    the next char (so `\\;` is not a separator).
+
+    A bare `&` is ALSO not always a separator: `2>&1`/`>&2`/`<&0` (fd
+    duplication) and `&>`/`&>>` (redirect both stdout+stderr) are single
+    redirect tokens, not the background-job operator. Missing this
+    (2026-07-10, caught in the first live enforce-mode test) split
+    `siemctl digest ... 2>&1` into `siemctl digest ... 2>` and a bogus
+    second "command" of literally `1` -- which obviously matches nothing,
+    so EVERY command redirecting stderr (extremely common in these role
+    prompts) false-denied. A bare `&` with no `>`/`<` immediately before
+    it is still treated as the real background-job separator.
+
+    A separator INSIDE a `$(...)` command substitution (or any
+    parenthesized group) is not a top-level separator either — e.g.
+    `TS=$(date -u +%N | cut -c1-3)` has a real `|`, but it's consumed by
+    the substitution, not splitting the outer command in two. Missing
+    this (2026-07-12, caught in the first live enforce-mode confirmation
+    pass across all 4 roles) split that exact form into a bogus
+    `TS=$(date -u +%N` "command" (matches nothing) plus ` cut -c1-3)` and
+    the rest — false-denying a common timestamp-generation idiom. Track
+    paren depth and only treat `;`/`|`/`&`/`&&`/`||`/`|&`/newline as
+    separators at depth 0; parens themselves are never separators."""
+    segs, buf = [], []
+    i, n, quote, depth = 0, len(cmd), None, 0
+    while i < n:
+        c = cmd[i]
+        if quote:
+            buf.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                buf.append(cmd[i + 1]); i += 2; continue
+            if c == quote:
+                quote = None
+            i += 1; continue
+        if c == "\\" and i + 1 < n:
+            buf.append(c); buf.append(cmd[i + 1]); i += 2; continue
+        if c in ("'", '"'):
+            quote = c; buf.append(c); i += 1; continue
+        if c == "(":
+            depth += 1; buf.append(c); i += 1; continue
+        if c == ")":
+            depth = max(0, depth - 1); buf.append(c); i += 1; continue
+        if depth > 0:
+            buf.append(c); i += 1; continue
+        if cmd[i:i + 2] in ("&&", "||", "|&"):
+            segs.append("".join(buf)); buf = []; i += 2; continue
+        if c == "&":
+            if cmd[i:i + 2] == "&>" or (buf and buf[-1] in (">", "<")):
+                buf.append(c); i += 1; continue  # part of a redirect, not a separator
+            segs.append("".join(buf)); buf = []; i += 1; continue
+        if c in (";", "|", "\n"):
+            segs.append("".join(buf)); buf = []; i += 1; continue
+        buf.append(c); i += 1
+    segs.append("".join(buf))
+    return [s for s in segs if s.strip()]
+
+def emit(decision, reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason}}))
+    sys.exit(0)
+
+def role_from_uid():
+    name = pwd.getpwuid(os.getuid()).pw_name
+    r = name[4:] if name.startswith("soc-") else name
+    return "tuner-dev" if r == "tunerdev" else r
+
+def log(role, verdict, tool, detail):
+    try:
+        os.makedirs(AUDIT_DIR, exist_ok=True)
+        line = "%s role=%s verdict=%s tool=%s %s\n" % (
+            datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            role, verdict, tool, detail)
+        with open(os.path.join(AUDIT_DIR, "%s.log" % role), "a") as f:
+            f.write(line)
+    except Exception:
+        pass  # logging must never break the tool call
+
+def rule_inner(rules, keys):
+    """Yield the inner specifier of each rule whose tool name is in `keys`,
+    e.g. Bash(siemctl digest *) with keys={'Bash'} -> 'siemctl digest *'."""
+    for r in rules:
+        m = re.match(r"^(\w+)\((.*)\)$", r)
+        if m and m.group(1) in keys:
+            yield m.group(2)
+
+# ---- Bash matching -----------------------------------------------------
+def bash_match(pat, cmd):
+    """pat is the inside of Bash(...)."""
+    if pat.endswith(" *"):
+        pre = pat[:-2]
+        return cmd == pre or cmd.startswith(pre + " ")
+    if "*" in pat:
+        return fnmatch.fnmatch(cmd, pat)
+    return cmd == pat
+
+def strip_wrappers(sub):
+    toks = sub.split()
+    while toks and toks[0] in WRAPPERS:
+        w = toks[0]
+        if w == "timeout":
+            # `timeout [OPTION]... DURATION COMMAND` — unlike the other
+            # wrappers, timeout takes a DURATION argument before the real
+            # command. Consume the wrapper, any options (and the args of the
+            # ones that take a separate arg), then the DURATION token, so the
+            # COMMAND is what gets matched. Otherwise `timeout 15 siemctl ...`
+            # is judged as the subcommand `15 siemctl ...` -> false NOMATCH
+            # (a false-deny in enforce; observed in the 2026-07-10 dry-run).
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                opt = toks[0]; toks = toks[1:]
+                if opt in ("-k", "--kill-after", "-s", "--signal") and toks:
+                    toks = toks[1:]  # separate-arg option
+            if toks:  # the DURATION
+                toks = toks[1:]
+        elif len(toks) > 1 and toks[1].startswith("-"):
+            # a wrapper used with an option we don't model — don't strip;
+            # let the whole thing be matched (safe direction: NOMATCH).
+            break
+        else:
+            toks = toks[1:]
+    return " ".join(toks)
+
+def bash_decision(cmd, allow, deny):
+    allow_p = list(rule_inner(allow, {"Bash"}))
+    deny_p  = list(rule_inner(deny,  {"Bash"}))
+    subs = [strip_wrappers(s.strip()) for s in split_bash(cmd)]
+    # deny wins if ANY subcommand matches a deny pattern
+    for s in subs:
+        for d in deny_p:
+            if bash_match(d, s):
+                return "deny", "matches deny rule Bash(%s)" % d
+    # allow only if EVERY subcommand is allow-listed or a read-only builtin
+    for s in subs:
+        first = s.split()[0] if s.split() else ""
+        if first in READONLY:
+            continue
+        if any(bash_match(a, s) for a in allow_p):
+            continue
+        return "none", "subcommand not in allowlist: %s" % s
+    return "allow", ""
+
+# ---- Simple tool-name matching (ToolSearch, Agent) ----------------------
+def tool_decision(tool, ti, allow, deny):
+    """Decision for tools with no Bash/file-path shape. ToolSearch is a
+    bare grant (no useful inner specifier to scope by -- it only ever
+    reads tool schemas, never executes one). Agent is scoped by
+    subagent_type: a subagent runs inside the same sandboxed process/UID
+    as its caller, so the act of delegating adds no reach by itself --
+    the tool profile handed to that particular subagent type is the real
+    variable, which is why this grants per named subagent_type
+    (Agent(Explore)) rather than the bare tool name."""
+    if tool == "Agent":
+        want = ti.get("subagent_type", "")
+        deny_types = set(rule_inner(deny, {"Agent"}))
+        allow_types = set(rule_inner(allow, {"Agent"}))
+        if want in deny_types:
+            return "deny", "matches deny rule Agent(%s)" % want
+        if want in allow_types:
+            return "allow", ""
+        return "none", "subagent_type not in allowlist: %s" % want
+    if tool in deny:
+        return "deny", "matches deny rule %s" % tool
+    if tool in allow:
+        return "allow", ""
+    return "none", "tool not in manifest"
+
+# ---- File-path matching ------------------------------------------------
+def resolve_anchor(pat, cwd):
+    """Return the pattern rewritten to an absolute-path glob, or None for
+    the settings-anchored /path form (which these manifests never use)."""
+    if pat.startswith("//"):
+        return "/" + pat[2:].lstrip("/")
+    if pat.startswith("~/"):
+        return os.path.join(os.path.expanduser("~"), pat[2:])
+    if pat.startswith("/"):
+        return None  # anchored at the settings file dir; unused here
+    return os.path.join(cwd, pat)  # cwd-relative (path or ./path)
+
+def path_to_regex(abspat):
+    # gitignore-ish: ** -> any (incl. /), * -> within a single segment
+    out, i = [], 0
+    while i < len(abspat):
+        if abspat[i:i+2] == "**":
+            out.append(".*"); i += 2
+        elif abspat[i] == "*":
+            out.append("[^/]*"); i += 1
+        else:
+            out.append(re.escape(abspat[i])); i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+def file_match(pat, fp, cwd):
+    anchor = resolve_anchor(pat, cwd)
+    if anchor is None:
+        return False
+    fp_abs = fp if os.path.isabs(fp) else os.path.normpath(os.path.join(cwd, fp))
+    return bool(path_to_regex(anchor).match(fp_abs))
+
+def file_decision(tool, fp, cwd, allow, deny):
+    # which pattern tools apply: Read->Read; Write/Edit family->Edit or Write
+    keys = {"Read"} if tool == "Read" else {"Edit", "Write"}
+    for d in rule_inner(deny, keys):
+        if file_match(d, fp, cwd):
+            return "deny", "matches deny rule on %s" % fp
+    for a in rule_inner(allow, keys):
+        if file_match(a, fp, cwd):
+            return "allow", ""
+    return "none", "path not in allowlist: %s" % fp
+
+# ---- main --------------------------------------------------------------
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        emit("defer", "unparseable hook input")
+    role = os.environ.get("ROLE_OVERRIDE") or role_from_uid()
+    mode = "audit"
+    # Per-role override file wins if present (staged enforce rollout, step
+    # 10) -- lets one role flip to enforce without moving every other role
+    # at once, and reverting one role is deleting/editing one small file
+    # instead of touching the shared default. Falls back to the global
+    # MODE_FILE, same fail-to-audit default as before if neither is readable.
+    per_role_file = os.path.join(os.path.dirname(MODE_FILE), "hook-mode-%s" % role)
+    try:
+        mode = open(per_role_file).read().strip() or "audit"
+    except Exception:
+        try:
+            mode = open(MODE_FILE).read().strip() or "audit"
+        except Exception:
+            pass
+    try:
+        man = json.load(open(os.path.join(MANIFEST_DIR, "manifest-enforced-%s.json" % role)))
+        allow = man["permissions"].get("allow", [])
+        deny  = man["permissions"].get("deny", [])
+    except Exception as e:
+        # no manifest for this identity -> fail safe: audit logs, enforce denies
+        if mode == "enforce":
+            log(role, "DENY", "?", "no manifest (%s)" % e); emit("deny", "no manifest for role %s" % role)
+        log(role, "NOMANIFEST", "?", str(e)); emit("allow", "audit: no manifest")
+
+    tool = data.get("tool_name", "?")
+    ti   = data.get("tool_input", {}) or {}
+    # Deliberately NOT data.get("cwd", ...): every manifest's cwd-relative
+    # patterns (Write(ticketing-system/**), etc.) are authored assuming the
+    # fixed project root (_meta.cwd_assumed on every manifest), but the
+    # hook payload's own "cwd" reflects the session's *actual* shell cwd,
+    # which drifts the moment a role runs a plain `cd` instead of `git -C
+    # <dir>`. Found live 2026-07-11: tuner-dev's own `cd
+    # /var/lib/soc/tunerdev/headless-siem` silently broke every subsequent
+    # Write/Edit permission check for the rest of that session (NOMATCH in
+    # audit, would be a real DENY in enforce) since the relative patterns
+    # then resolved against the worktree instead of SOC_ROOT. Anchoring to
+    # the fixed constant instead makes file-permission matching immune to
+    # a role's own directory-changing commands.
+    cwd  = SOC_ROOT
+
+    if tool == "Bash":
+        verdict, reason = bash_decision(ti.get("command", ""), allow, deny)
+        detail = "cmd=%r" % ti.get("command", "")
+    elif tool in ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit"):
+        verdict, reason = file_decision(tool, ti.get("file_path", ""), cwd, allow, deny)
+        detail = "file=%r" % ti.get("file_path", "")
+    elif tool in ("ToolSearch", "Agent"):
+        verdict, reason = tool_decision(tool, ti, allow, deny)
+        detail = "input=%r" % ti
+    else:
+        verdict, reason = "none", "tool not in manifest"
+        detail = "input=%r" % ti
+
+    if verdict == "allow":
+        emit("allow", "")
+    # verdict is "deny" (deny-match) or "none" (out of allowlist)
+    if mode == "enforce":
+        log(role, "DENY", tool, "%s %s" % (detail, reason))
+        emit("deny", "[soc-hook/enforce] %s" % reason)
+    else:
+        # §7 Stage A: the hook NEVER blocks; the narrow native deny list is
+        # what actually blocks catastrophic calls during audit. Log and allow.
+        log(role, "AUDIT-%s" % ("DENYMATCH" if verdict == "deny" else "NOMATCH"),
+            tool, "%s %s" % (detail, reason))
+        emit("allow", "audit: out-of-manifest, logged not blocked")
+
+if __name__ == "__main__":
+    main()

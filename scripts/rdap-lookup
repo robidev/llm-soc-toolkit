@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""rdap-lookup <ip>
+
+Read-only RDAP (RFC 7483) registration lookup for a single IP address, via
+the IANA RDAP bootstrap redirector (rdap.org). Prints a short plain-text
+summary (registrant name/org, RIR handle, CIDR range(s), country, status)
+to stdout -- not raw JSON, so no jq/python parsing needed downstream.
+
+Built for runbooks/haproxy.md's "Known-benign: registered office/admin
+access" check and its equivalents elsewhere: before treating an
+unfamiliar IP as benign because it's "probably the office," verify the
+range is actually registered to the org you think it is, rather than
+trusting the shape of the traffic alone.
+
+Safety note (why this is allow-listable for sandboxed SOC roles that
+otherwise have no general network access): the only network call this
+makes is a GET to a URL it builds itself from a strictly-validated IP
+argument (https://rdap.org/ip/<ip>). The caller can never influence the
+host, path, query string, or any header -- there is no argument surface
+beyond "which IP" for a prompt-injected log line to abuse. This is not a
+general HTTP client; don't extend it into one (see the argument
+validation below -- it's load-bearing, not incidental).
+
+Exit 0 and print the summary on success. Exit 1 and print a reason on
+stderr on any failure (bad argument, network error, unexpected response
+shape) -- never a stack trace to stdout.
+"""
+import ipaddress
+import json
+import sys
+import urllib.error
+import urllib.request
+
+TIMEOUT_SECONDS = 10
+USER_AGENT = "llm-soc-toolkit-rdap-lookup/1.0"
+
+
+def die(msg):
+    print("rdap-lookup: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def registrant_org(data):
+    """Best-effort org name from `entities`.
+
+    Some RIRs (RIPE) put a real org name straight in the top-level `name`
+    field; others (ARIN et al.) leave that sparse and only name the org in
+    `entities`. This is a fallback, not the primary source -- see main().
+    Prefers a vCard `kind: org` entity (e.g. "Alliander N.V.") over a
+    same-role maintainer/individual entity (e.g. "mnt-alliander",
+    "RIPE-NCC-END-MNT") -- RDAP responses commonly list several
+    `registrant`-role entities and the org-kind one is the readable one.
+    """
+    fallback = None
+    for ent in data.get("entities") or []:
+        vcard = ent.get("vcardArray")
+        if not vcard or len(vcard) < 2:
+            continue
+        fn, kind = None, None
+        for field in vcard[1]:
+            if not field:
+                continue
+            if field[0] == "fn" and len(field) > 3:
+                fn = field[3]
+            elif field[0] == "kind" and len(field) > 3:
+                kind = field[3]
+        if not fn:
+            continue
+        if kind == "org":
+            return fn
+        if fallback is None and "registrant" in (ent.get("roles") or []):
+            fallback = fn
+    return fallback
+
+
+def main():
+    if len(sys.argv) != 2:
+        die("usage: rdap-lookup <ip>")
+
+    raw = sys.argv[1]
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        die("not a valid IP address: %r" % raw)
+
+    url = "https://rdap.org/ip/%s" % ip
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "application/rdap+json"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        die("lookup for %s failed: HTTP %s" % (ip, e.code))
+    except (urllib.error.URLError, OSError) as e:
+        die("lookup for %s failed: %s" % (ip, e))
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        die("response for %s was not valid JSON" % ip)
+
+    handle = data.get("handle") or ""
+    name = data.get("name") or ""
+    country = data.get("country") or ""
+    status = ", ".join(data.get("status") or [])
+    cidrs = ", ".join(
+        "%s/%s" % (c["v4prefix"], c["length"])
+        for c in (data.get("cidr0_cidrs") or [])
+        if "v4prefix" in c and "length" in c
+    ) or ", ".join(
+        "%s/%s" % (c["v6prefix"], c["length"])
+        for c in (data.get("cidr0_cidrs") or [])
+        if "v6prefix" in c and "length" in c
+    )
+    org = registrant_org(data)
+
+    print("ip: %s" % ip)
+    if handle:
+        print("range: %s" % handle)
+    if cidrs:
+        print("cidr: %s" % cidrs)
+    if name:
+        print("name: %s" % name)
+    if org and org != name:
+        print("org: %s" % org)
+    if country:
+        print("country: %s" % country)
+    if status:
+        print("status: %s" % status)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

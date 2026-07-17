@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(soc-structure/manifests/manifest-enforced-analyst.json)",
+      "Read(scripts/hook-check)",
+      "Read(//etc/soc/hook-mode-analyst)",
+      "Bash(D=$(date -u +%Y%m%dT%H%M%S).$(date -u +%N | cut -c1-3))",
+      "Bash(for s in *)",
+      "Bash(do)",
+      "Bash(done)",
+      "Bash(siemctl digest *)",
+      "Bash(siemctl alerts *)",
+      "Bash(siemctl search *)",
+      "Bash(siemctl stats *)",
+      "Bash(siemctl tail *)",
+      "Bash(rdap-lookup *)",
+      "Bash(grep *)",
+      "Bash(jq *)",
+      "Bash(sed -n *)",
+      "Bash(sudo /usr/local/bin/soc-restart-pipeline)",
+      "Bash(ticket-route *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify high *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify critical *)",
+      "Read(runbooks/**)",
+      "Read(config/normalized.toml)",
+      "Read(ticketing-system/**)",
+      "Read(//var/lib/soc/analyst/tmp/**)",
+      "Read(//var/lib/soc/analyst/.claude/**)",
+      "Edit(//var/lib/soc/analyst/.claude/**)",
+      "Read(agent-logs/analyst.log)",
+      "Edit(ticketing-system/analyst/**)",
+      "Edit(ticketing-system/unassigned/**)",
+      "Edit(agent-logs/analyst.log)"
+    ],
+    "deny": [
+      "Bash(siemctl retention *)",
+      "Bash(siemctl dry-run *)",
+      "Bash(siemctl validate *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify low *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify medium *)",
+      "Read(documentation/canary-hosts.md)"
+    ]
+  }
+}

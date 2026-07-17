@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""soc-ticket <list|show|comment|close|reopen|reassign> ...
+
+Human-facing ticket review/management tool -- a thin, deterministic
+wrapper around the same markdown ticket files every SOC role reads and
+writes (see ticketing-system/system.md for the format). Not something any
+LLM role invokes -- this is for the operator to review, comment on,
+close, or redirect tickets by hand instead of hand-editing files or
+hunting across folders with find/grep.
+
+Runs as root: ticket folders are role-owned and not uniformly readable by
+the plain `user` account (ticketing-system/{specialist,tuner-dev,soclead}
+are 750, only the owning soc-<role> account -- or root -- can read them).
+
+    sudo soc-ticket list                          # every open/in_progress ticket, all folders
+    sudo soc-ticket list --status all             # include closed too
+    sudo soc-ticket list --status closed          # only closed
+    sudo soc-ticket list --role tuner-dev         # just one folder
+    sudo soc-ticket list --type bug               # just one ticket type
+    sudo soc-ticket show <filename>               # full raw content
+    sudo soc-ticket comment <filename> "<text>"   # append a Comments line (human exception, system.md)
+    sudo soc-ticket close <filename> ["<text>"]   # optional closing comment, then status:closed + CLOSED_ rename
+    sudo soc-ticket reopen <filename>              # undo a close (status:open, strip CLOSED_)
+    sudo soc-ticket reassign <filename> <role>    # move to another folder + chown (never `analyst`)
+
+<filename> accepts a bare ticket filename (with or without the CLOSED_
+prefix -- looked up across every folder) or a path; ambiguous/missing
+matches are a hard error rather than a guess.
+
+Concurrency note (ticketing-system/system.md's ownership rule): this tool
+bypasses the normal "only the assignee may edit" restriction the same way
+the two documented human-comment/reassign exceptions already do -- that's
+fine for the *human* to do deliberately, at any time, but be aware that
+mutating a ticket (close/reassign) while its owning role's cron might be
+mid-run against the same file is the one scenario system.md's concurrency
+model doesn't cover. Not a real risk today (nothing is on a live cron
+yet), worth remembering once it is.
+"""
+import sys, os, re, glob, argparse, datetime, shutil, grp, pwd
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SOC_ROOT = os.path.dirname(SCRIPT_DIR)
+TS = os.path.join(SOC_ROOT, "ticketing-system")
+
+FOLDERS = ("unassigned", "analyst", "specialist", "tuner-dev", "soclead", "user")
+# Never `analyst` (system.md: "nothing may be assigned to analyst") and
+# never `unassigned` (a staging area, not a real destination for a
+# deliberate human reassignment) -- same invariant scripts/ticket-assign enforces.
+DEST_ROLES = ("specialist", "tuner-dev", "soclead", "user")
+OWNER = {"user": "user", "specialist": "soc-specialist", "tuner-dev": "soc-tunerdev", "soclead": "soc-soclead"}
+
+FNAME_RE = re.compile(r"^(CLOSED_)?(\d{8}T\d{6}\.\d+)_([a-z0-9-]+)\.md$")
+
+PRIORITY_COLOR = {"critical": "\033[1;31m", "high": "\033[31m", "medium": "\033[33m", "low": "\033[2m"}
+RESET = "\033[0m"
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def all_tickets():
+    """Yield (folder, path) for every real ticket file across every folder,
+    newest-created first (the filename's own timestamp prefix sorts
+    correctly as a string)."""
+    for folder in FOLDERS:
+        d = os.path.join(TS, folder)
+        if not os.path.isdir(d):
+            continue
+        for path in sorted(glob.glob(os.path.join(d, "*.md")), reverse=True):
+            base = os.path.basename(path)
+            if base == ".gitkeep" or not FNAME_RE.match(base):
+                continue
+            yield folder, path
+
+
+def parse_ticket(path):
+    """Minimal frontmatter + Subject parser. The format (system.md) is
+    flat `key: value` lines between two `---` delimiters, with
+    Subject/Details/Comments always body content, never frontmatter -- so
+    a full YAML parser is unwarranted here."""
+    with open(path) as f:
+        text = f.read()
+    fm = {}
+    subject = ""
+    parts = text.split("---", 2)
+    if len(parts) >= 3:
+        for line in parts[1].splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip()
+        body = parts[2]
+    else:
+        body = text
+    m = re.search(r"^##\s*Subject\s*$(.*?)(^##\s|\Z)", body, re.MULTILINE | re.DOTALL)
+    if m:
+        for line in m.group(1).splitlines():
+            line = line.strip()
+            if line:
+                subject = line
+                break
+    return fm, subject
+
+
+def find_ticket(name):
+    """Resolve a bare filename (with or without CLOSED_) or a path to
+    exactly one (folder, path). Zero or multiple matches is a hard error
+    -- this tool never guesses which ticket you meant."""
+    if os.sep in name:
+        if not os.path.exists(name):
+            sys.exit("soc-ticket: no such file: %s" % name)
+        base = os.path.basename(name)
+    else:
+        base = name
+    matches = []
+    for folder, path in all_tickets():
+        pbase = os.path.basename(path)
+        if pbase == base or pbase == "CLOSED_" + base or pbase == base.replace("CLOSED_", "", 1):
+            matches.append((folder, path))
+    # de-dupe (the three checks above can double-match the exact-name case)
+    matches = sorted(set(matches))
+    if not matches:
+        sys.exit("soc-ticket: no ticket matching %r found" % name)
+    if len(matches) > 1:
+        sys.exit("soc-ticket: ambiguous, matches:\n  " + "\n  ".join(p for _, p in matches))
+    return matches[0]
+
+
+def append_comment(path, text, author="user"):
+    with open(path) as f:
+        content = f.read()
+    if not content.endswith("\n"):
+        content += "\n"
+    content += "- %s %s: %s\n" % (now_iso(), author, text)
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def set_frontmatter_field(path, field, value):
+    with open(path) as f:
+        content = f.read()
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        sys.exit("soc-ticket: %s doesn't look like a well-formed ticket (no frontmatter)" % path)
+    pat = re.compile(r"^%s:.*$" % re.escape(field), re.MULTILINE)
+    new_line = "%s: %s" % (field, value)
+    if pat.search(parts[1]):
+        parts[1] = pat.sub(new_line, parts[1], count=1)
+    else:
+        parts[1] = parts[1].rstrip("\n") + "\n" + new_line + "\n"
+    with open(path, "w") as f:
+        f.write("---".join(parts))
+
+
+# ---- subcommands ------------------------------------------------------
+
+def cmd_list(args):
+    rows = []
+    for folder, path in all_tickets():
+        if args.role and folder != args.role:
+            continue
+        fm, subject = parse_ticket(path)
+        status = fm.get("status", "?")
+        if args.status == "open":
+            if status not in ("open", "in_progress"):
+                continue
+        elif args.status != "all" and status != args.status:
+            continue
+        if args.type and fm.get("type") != args.type:
+            continue
+        rows.append((folder, os.path.basename(path), fm, subject))
+    if not rows:
+        print("(no matching tickets)")
+        return
+    for folder, base, fm, subject in rows:
+        pr, st, ty, iss = fm.get("priority", "?"), fm.get("status", "?"), fm.get("type", "?"), fm.get("issuer", "?")
+        col = PRIORITY_COLOR.get(pr, "")
+        print("%s[%-11s] %-11s %-14s %-8s from=%-10s%s %s" % (col, folder, st, ty, pr, iss, RESET, base))
+        if subject:
+            print("    %s" % subject)
+
+
+def cmd_show(args):
+    _, path = find_ticket(args.ticket)
+    with open(path) as f:
+        sys.stdout.write(f.read())
+
+
+def cmd_comment(args):
+    folder, path = find_ticket(args.ticket)
+    append_comment(path, args.text)
+    print("commented on %s/%s" % (folder, os.path.basename(path)))
+
+
+def cmd_close(args):
+    folder, path = find_ticket(args.ticket)
+    base = os.path.basename(path)
+    if base.startswith("CLOSED_"):
+        sys.exit("soc-ticket: %s is already closed" % base)
+    if args.comment:
+        append_comment(path, args.comment)
+    set_frontmatter_field(path, "status", "closed")
+    set_frontmatter_field(path, "closed", now_iso())
+    newpath = os.path.join(os.path.dirname(path), "CLOSED_" + base)
+    os.rename(path, newpath)
+    print("closed %s/%s -> CLOSED_%s" % (folder, base, base))
+
+
+def cmd_reopen(args):
+    folder, path = find_ticket(args.ticket)
+    base = os.path.basename(path)
+    if not base.startswith("CLOSED_"):
+        sys.exit("soc-ticket: %s is not closed" % base)
+    set_frontmatter_field(path, "status", "open")
+    set_frontmatter_field(path, "closed", "")
+    newbase = base[len("CLOSED_"):]
+    newpath = os.path.join(os.path.dirname(path), newbase)
+    if os.path.exists(newpath):
+        sys.exit("soc-ticket: refusing to reopen -- %s already exists" % newpath)
+    os.rename(path, newpath)
+    print("reopened %s/%s -> %s" % (folder, base, newbase))
+
+
+def cmd_reassign(args):
+    folder, path = find_ticket(args.ticket)
+    dest = args.dest_role
+    if dest not in DEST_ROLES:
+        sys.exit("soc-ticket: invalid dest role %r (must be one of: %s)" % (dest, ", ".join(DEST_ROLES)))
+    if dest == folder:
+        sys.exit("soc-ticket: %s is already in %s" % (os.path.basename(path), dest))
+    base = os.path.basename(path)
+    destdir = os.path.join(TS, dest)
+    destpath = os.path.join(destdir, base)
+    if os.path.exists(destpath):
+        sys.exit("soc-ticket: refusing to overwrite existing %s" % destpath)
+    shutil.move(path, destpath)
+    owner = OWNER[dest]
+    try:
+        uid = pwd.getpwnam(owner).pw_uid
+        gid = grp.getgrnam("socroles").gr_gid
+        os.chown(destpath, uid, gid)
+        os.chmod(destpath, 0o640)
+    except (KeyError, PermissionError) as e:
+        print("warning: moved but couldn't chown to %s (%s) -- fix ownership by hand" % (owner, e), file=sys.stderr)
+    print("reassigned %s/%s -> %s/%s (owner %s)" % (folder, base, dest, base, owner))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="soc-ticket")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list", help="list tickets")
+    p.add_argument("--role", choices=FOLDERS, help="restrict to one folder")
+    p.add_argument("--status", default="open", choices=["open", "in_progress", "closed", "all"],
+                    help="'open' also includes in_progress (default); 'all' includes closed too")
+    p.add_argument("--type", help="restrict to one ticket type (bug, tuning, incident, ...)")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show", help="print a ticket's full content")
+    p.add_argument("ticket")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("comment", help="append a Comments line as 'user'")
+    p.add_argument("ticket")
+    p.add_argument("text")
+    p.set_defaults(func=cmd_comment)
+
+    p = sub.add_parser("close", help="close a ticket (status+rename), optional closing comment")
+    p.add_argument("ticket")
+    p.add_argument("comment", nargs="?")
+    p.set_defaults(func=cmd_close)
+
+    p = sub.add_parser("reopen", help="undo a close")
+    p.add_argument("ticket")
+    p.set_defaults(func=cmd_reopen)
+
+    p = sub.add_parser("reassign", help="move a ticket to another folder + chown")
+    p.add_argument("ticket")
+    p.add_argument("dest_role", choices=DEST_ROLES)
+    p.set_defaults(func=cmd_reassign)
+
+    a = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("soc-ticket: ticket folders are role-owned -- run with sudo")
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

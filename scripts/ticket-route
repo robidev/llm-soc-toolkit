@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""ticket-route <path>
+
+Unprivileged, same-turn validator for the `assigned_to:` frontmatter
+field. A role calls this right after writing a new
+ticket into ticketing-system/unassigned/, to get immediate feedback on
+whether `assigned_to:` names a real destination -- BEFORE the trusted
+sweep (scripts/ticket-route-sweep, run from soc-run-role, outside any
+sandbox) picks it up and performs the actual privileged move via the
+unchanged scripts/ticket-assign. Without this, a typo'd or forbidden
+assigned_to would sit silently in unassigned/ until something else
+noticed.
+
+Reads and validates only -- never moves, edits, or creates anything, so
+it needs no privilege and no sudoers rule; a role runs it directly.
+
+Exit 0 and print "OK: ..." on a valid, resolvable assigned_to.
+Exit 1 and print a reason on stderr otherwise.
+"""
+import sys
+import os
+import re
+
+SOC_ROOT = os.environ.get("SOC_ROOT", "/home/user/projects/llm-soc-toolkit")  # [SOC-ROOT-PATH]; env override for testing, same pattern as soc-build-settings' SOC_ETC
+UNASSIGNED = os.path.join(SOC_ROOT, "ticketing-system", "unassigned")
+
+FNAME_RE = re.compile(r"^\d{8}T\d{6}\.\d+_[a-z0-9-]+\.md$")  # never CLOSED_ in unassigned/
+# Same allowlist scripts/ticket-assign enforces -- never 'analyst'
+# (ticketing-system/system.md: nothing may be assigned to analyst) and
+# never 'unassigned' (a staging area, not a destination).
+DEST_ROLES = {"specialist", "tuner-dev", "soclead", "user"}
+
+
+def die(msg):
+    print("ticket-route: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) != 2:
+        die("usage: ticket-route <path>")
+    arg = sys.argv[1]
+    base = os.path.basename(arg)
+    if not FNAME_RE.match(base):
+        die("not a valid ticket filename: %s" % base)
+
+    try:
+        real = os.path.realpath(arg)
+        unassigned_real = os.path.realpath(UNASSIGNED)
+    except OSError as e:
+        die("cannot resolve path: %s" % e)
+    if os.path.dirname(real) != unassigned_real:
+        die("%s is not in ticketing-system/unassigned/ -- assigned_to only matters there" % base)
+    if not os.path.isfile(real) or os.path.islink(arg):
+        die("not a regular file: %s" % base)
+
+    try:
+        with open(real) as f:
+            text = f.read()
+    except OSError as e:
+        die("cannot read %s: %s" % (base, e))
+
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        die("%s doesn't look like a well-formed ticket (no frontmatter)" % base)
+
+    assigned_to = None
+    for line in parts[1].splitlines():
+        line = line.strip()
+        if line.startswith("assigned_to:"):
+            assigned_to = line.split(":", 1)[1].strip()
+            break
+
+    if not assigned_to:
+        die("no assigned_to: field set in %s -- add one before the routing sweep can pick this up" % base)
+    if assigned_to not in DEST_ROLES:
+        die("assigned_to=%r is not a valid destination (must be one of: %s)"
+            % (assigned_to, ", ".join(sorted(DEST_ROLES))))
+
+    print("OK: %s -> assigned_to=%s (will be routed by the next sweep)" % (base, assigned_to))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

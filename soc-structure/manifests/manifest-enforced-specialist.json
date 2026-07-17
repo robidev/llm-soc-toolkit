@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(soc-structure/manifests/manifest-enforced-specialist.json)",
+      "Read(scripts/hook-check)",
+      "Read(//etc/soc/hook-mode-specialist)",
+      "Bash(siemctl status *)",
+      "Bash(siemctl stats *)",
+      "Bash(siemctl search *)",
+      "Bash(siemctl alerts *)",
+      "Bash(siemctl digest *)",
+      "Bash(siemctl tail *)",
+      "Bash(rdap-lookup *)",
+      "Bash(grep *)",
+      "Bash(ticket-route *)",
+      "Bash(ticket-reassign *)",
+      "Bash(ticket-close *)",
+      "Bash(/usr/local/bin/ticket-route *)",
+      "Bash(/usr/local/bin/ticket-reassign *)",
+      "Bash(/usr/local/bin/ticket-close *)",
+      "Bash(/home/user/projects/llm-soc-toolkit/scripts/ticket-route *)",
+      "Bash(/home/user/projects/llm-soc-toolkit/scripts/ticket-reassign *)",
+      "Bash(/home/user/projects/llm-soc-toolkit/scripts/ticket-close *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify low *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify medium *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify high *)",
+      "Bash(sudo -u soc-infra /home/user/projects/llm-soc-toolkit/scripts/soc-notify critical *)",
+      "Read(runbooks/**)",
+      "Read(soc_context/cmdb/proxmox_export.json)",
+      "Read(ticketing-system/**)",
+      "Read(//var/lib/soc/specialist/.claude/**)",
+      "Edit(//var/lib/soc/specialist/.claude/**)",
+      "Edit(ticketing-system/specialist/**)",
+      "Edit(ticketing-system/unassigned/**)",
+      "Read(agent-logs/specialist.log)",
+      "Edit(agent-logs/specialist.log)"
+    ],
+    "deny": [
+      "Bash(siemctl retention *)",
+      "Bash(siemctl dry-run *)",
+      "Bash(siemctl validate *)",
+      "Read(documentation/canary-hosts.md)"
+    ]
+  }
+}

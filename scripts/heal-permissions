@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""heal-permissions
+
+Runs as root, from soc-run-role, OUTSIDE any role's sandbox (phase7
+housekeeping build, cluster 1 item C / §7.3). Backstop against
+permission drift that's already happened by hand at least 3 times:
+files that end up owned by the wrong soc-<role> account, or with the
+wrong mode, after some out-of-band operation (a manual chown while
+debugging, a restore from backup, etc).
+
+Idempotent and state-scan-based, not run-scoped, same shape as
+scripts/ticket-route-sweep: every invocation just re-asserts the
+correct owner/group/mode on whatever currently exists -- no queue or
+state file of its own to go stale.
+
+Root-cause note: `.notify-count`/`.watchdog-state`'s original bug
+(missing ReadWritePaths) is already fixed structurally in
+soc-run-role's rw=(...) array -- this script is a pure drift backstop
+for those two paths, not a workaround. The ticket CLOSED_ rename gap is
+a manifest/allowlist issue, explicitly out of scope here.
+
+`runbook-drafts/` (added 2026-07-16, tuner-dev-only staging dir for
+drafted-not-merged runbook content) is the same shape as the two
+paths above but for directory ownership rather than a missing
+ReadWritePaths entry: caught live the day it was added, created via a
+plain `mkdir` and left `user:user`, silently defeating an otherwise-
+correct manifest grant + ReadWritePaths entry since Unix DAC
+permissions are invisible to both of those layers.
+
+USAGE:
+  heal-permissions <analyst|specialist|tuner-dev|soclead>   heal one role
+  heal-permissions --all                                    heal all four
+
+Both modes also heal the shared, role-agnostic state under
+.notify-count/ and .watchdog-state/ (soc-infra:socroles) -- cheap, so
+it happens unconditionally on every call regardless of which role is
+running, not gated behind --all.
+"""
+import sys
+import os
+import subprocess
+
+SOC_ROOT = os.environ.get("SOC_ROOT", "/home/user/projects/llm-soc-toolkit")  # [SOC-ROOT-PATH]; env override for testing, same pattern as soc-build-settings' SOC_ETC
+AGENT_LOGS = os.path.join(SOC_ROOT, "agent-logs")
+AUDIT_DIR = os.path.join(SOC_ROOT, "permission-audit")
+TICKETING = os.path.join(SOC_ROOT, "ticketing-system")
+MANIFESTS = os.path.join(SOC_ROOT, "soc-structure", "manifests")
+NOTIFY_COUNT = os.path.join(SOC_ROOT, ".notify-count")
+WATCHDOG_STATE = os.path.join(SOC_ROOT, ".watchdog-state")
+RUNBOOK_DRAFTS = os.path.join(SOC_ROOT, "runbook-drafts")
+
+ROLES = ("analyst", "specialist", "tuner-dev", "soclead")
+ROLE_USER = {
+    "analyst": "soc-analyst",
+    "specialist": "soc-specialist",
+    "tuner-dev": "soc-tunerdev",
+    "soclead": "soc-soclead",
+}
+
+failed = False
+
+
+def warn(msg):
+    global failed
+    failed = True
+    print("heal-permissions: %s" % msg, file=sys.stderr)
+
+
+def chown(path, owner_group):
+    r = subprocess.run(["chown", owner_group, path], capture_output=True, text=True)
+    if r.returncode != 0:
+        warn("chown %s %s failed: %s" % (owner_group, path, r.stderr.strip()))
+
+
+def chmod(path, mode):
+    try:
+        os.chmod(path, mode)
+    except OSError as e:
+        warn("chmod %o %s failed: %s" % (mode, path, e))
+
+
+def has_append_only(path):
+    r = subprocess.run(["lsattr", "-d", path], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.split():
+        return False
+    return "a" in r.stdout.split()[0]
+
+
+def chattr(path, flag):
+    subprocess.run(["chattr", flag, path], capture_output=True, text=True)
+
+
+def heal_agent_log(role, owner):
+    path = os.path.join(AGENT_LOGS, "%s.log" % role)
+    if not os.path.isfile(path):
+        return
+    chown(path, "%s:socroles" % owner)
+    chmod(path, 0o640)
+
+
+def heal_audit_log(role, owner):
+    path = os.path.join(AUDIT_DIR, "%s.log" % role)
+    if not os.path.isfile(path):
+        return
+    # Never drop the append-only bit even transiently: check it first,
+    # unset only long enough to chown/chmod, then reapply.
+    had_append = has_append_only(path)
+    if had_append:
+        chattr(path, "-a")
+    chown(path, "%s:socroles" % owner)
+    chmod(path, 0o600)
+    if had_append:
+        chattr(path, "+a")
+
+
+def heal_ticket_dir(role, owner):
+    # Assigned tickets only -- never touches ticketing-system/unassigned/,
+    # which is deliberately root:socroles (see ticket-route-sweep).
+    d = os.path.join(TICKETING, role)
+    if not os.path.isdir(d):
+        return
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        chown(path, "%s:socroles" % owner)
+        chmod(path, 0o640)
+
+
+def heal_runbook_drafts():
+    # tuner-dev-only staging dir (2026-07-16) for drafted-not-merged
+    # runbook content -- single-writer, same shape as ticketing-system/
+    # tuner-dev/, so same owner/mode. Caught live the day it was added:
+    # a plain `mkdir` left it user:user, which silently defeated the
+    # manifest Edit(runbook-drafts/**) grant and soc-run-role's
+    # ReadWritePaths entry (both correct) since Unix DAC permissions
+    # were the actual blocker -- neither of those layers can see or fix
+    # that, only this drift backstop can. Directory itself needs
+    # healing (not just files within it, unlike heal_ticket_dir, whose
+    # target directories are never expected to drift themselves).
+    d = RUNBOOK_DRAFTS
+    if not os.path.isdir(d):
+        return
+    chown(d, "soc-tunerdev:socroles")
+    chmod(d, 0o750)
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        chown(path, "soc-tunerdev:socroles")
+        chmod(path, 0o640)
+
+
+def heal_manifests():
+    # Manifest files in soc-structure/manifests/ must be readable by socroles group
+    # (roles verify their own permissions from these files). These are configuration
+    # files that get edited/deployed, so they're drift-prone. Always owned by operator
+    # (user), readable by socroles (640).
+    if not os.path.isdir(MANIFESTS):
+        return
+    for name in sorted(os.listdir(MANIFESTS)):
+        if not name.startswith("manifest-enforced-") or not name.endswith(".json"):
+            continue
+        path = os.path.join(MANIFESTS, name)
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        chown(path, "user:socroles")
+        chmod(path, 0o640)
+
+
+def heal_role(role):
+    owner = ROLE_USER[role]
+    heal_agent_log(role, owner)
+    heal_audit_log(role, owner)
+    heal_ticket_dir(role, owner)
+    if role == "tuner-dev":
+        heal_runbook_drafts()
+
+
+def heal_shared_state():
+    if os.path.isdir(NOTIFY_COUNT):
+        for name in sorted(os.listdir(NOTIFY_COUNT)):
+            if not name.endswith(".sent"):
+                continue
+            path = os.path.join(NOTIFY_COUNT, name)
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            chown(path, "soc-infra:socroles")
+    if os.path.isdir(WATCHDOG_STATE):
+        for name in sorted(os.listdir(WATCHDOG_STATE)):
+            path = os.path.join(WATCHDOG_STATE, name)
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            chown(path, "soc-infra:socroles")
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("heal-permissions: must run as root")
+
+    args = sys.argv[1:]
+    if args == ["--all"]:
+        for role in ROLES:
+            heal_role(role)
+    elif len(args) == 1 and args[0] in ROLES:
+        heal_role(args[0])
+    else:
+        sys.exit("usage: heal-permissions <%s>|--all" % "|".join(ROLES))
+
+    heal_manifests()
+    heal_shared_state()
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

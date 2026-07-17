@@ -1,0 +1,20 @@
+[Unit]
+Description=LLM-based SOC - Agent Watchdog (dead-cron protection)
+Documentation=file:///home/user/projects/llm-soc-toolkit/documentation/escalation.md
+
+[Service]
+Type=oneshot
+User=soc-infra
+WorkingDirectory=/home/user/projects/llm-soc-toolkit
+ExecStart=/home/user/projects/llm-soc-toolkit/scripts/agent-watchdog
+StandardOutput=journal
+StandardError=journal
+
+# soc-infra, not root: agent-watchdog only reads agent-logs/<role>.log
+# (0640, group socroles -- soc-infra's group) and soc-notify/.watchdog-state
+# (both soc-infra:socroles) -- unlike soc-escalate/context-balloon-scan it
+# never needs another role's root-only 600 files, and it has no internal
+# `sudo -u soc-infra` of its own (ticketing-system/tuner-dev/
+# CLOSED_20260711T175541.738_notify-count-permission-denied.md), so the
+# unit must set the user directly rather than relying on the script to
+# drop privilege itself.

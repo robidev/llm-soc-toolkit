@@ -1,0 +1,14 @@
+[Unit]
+Description=LLM-based SOC - Analyst Role Run Timer
+
+[Timer]
+# Hourly by default -- a tighter cadence (down to every ~10min) is viable
+# if your cron budget allows it; soc-agent-watchdog's staleness threshold
+# for this role should track whatever cadence you actually pick (see
+# soc-agent-watchdog's own timer/script for the ~2.5x-cadence formula).
+OnCalendar=hourly
+RandomizedDelaySec=3m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

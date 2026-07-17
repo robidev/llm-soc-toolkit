@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+#
+# tuner-review — streamlines reviewing a tuner-dev fix branch end to end:
+# fetch, scoped diff, test gate, (human approval), merge, push, deploy,
+# check-deploy-drift, prompt for a live-verification note, close the
+# ticket. Pure mechanics, no LLM involved — see documentation/
+# tuner-dev-branch-merge.md for the full manual walkthrough this
+# automates; read that first if anything here surprises you.
+#
+# Deliberately does NOT auto-restart systemd units (matches
+# redeploy-binary's own --restart-is-opt-in convention — restarting a
+# live pipeline component blind can cause pipe-EOF/syslogd-crash-shaped
+# incidents downstream) and does NOT auto-delete the merged
+# branch (housekeeping stays a deliberate human call, same as the doc's
+# own step 9).
+#
+# USAGE: sudo scripts/tuner-review <ticket-path>
+#
+set -euo pipefail
+
+SOC_ROOT=/home/user/projects/llm-soc-toolkit      # [SOC-ROOT-PATH]
+SIEM_REPO=/home/user/projects/headless-siem      # [SOC-ROOT-PATH] the dev checkout
+TUNER_REPO=/var/lib/soc/tunerdev/headless-siem
+
+log() { printf '  %s\n' "$*"; }
+die() { echo "tuner-review: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root (sudo scripts/tuner-review <ticket-path>) -- the tuner-dev worktree is root/soc-tunerdev-owned"
+[[ $# -eq 1 ]] || die "usage: sudo scripts/tuner-review <ticket-path>"
+
+TICKET="$1"
+[[ -f "$TICKET" ]] || die "ticket not found: $TICKET"
+
+# ── 0. parse the ticket ────────────────────────────────────────────────
+echo "== 0. parse ticket =="
+BRANCH="$(grep -oE 'Branch: `tuner-dev/[a-zA-Z0-9._/-]+`' "$TICKET" | head -1 \
+  | sed -E 's/Branch: `(.*)`/\1/' || true)"
+[[ -n "$BRANCH" ]] || die "no 'Branch: \`tuner-dev/...\`' line found in $TICKET"
+SUBJECT="$(awk '/^## Subject$/{f=1;next} f && NF{print; exit}' "$TICKET")"
+log "branch:  $BRANCH"
+log "subject: ${SUBJECT:-<none found>}"
+
+# ── 1. fetch the branch out of tuner-dev's isolated worktree ──────────
+echo "== 1. fetch =="
+git -C "$SIEM_REPO" fetch "$TUNER_REPO" "+refs/heads/$BRANCH:refs/heads/$BRANCH" --quiet
+log "fetched into $SIEM_REPO as local branch '$BRANCH' (force-updated if it already existed)"
+
+MB="$(git -C "$SIEM_REPO" merge-base master "$BRANCH")"
+log "merge-base with master: ${MB:0:8}"
+
+# ── 2. scoped diff — merge-base, NOT tip-to-tip, so master drift after
+#      the branch forked (a doc change, an earlier approved merge) never
+#      shows up as part of this review ──────────────────────────────────
+echo "== 2. commits + scoped diff (master...${BRANCH}) =="
+git -C "$SIEM_REPO" log --oneline "$MB..$BRANCH"
+echo
+git -C "$SIEM_REPO" diff "master...$BRANCH"
+echo
+
+# Captured once, from the branch's own three-dot diff — reused below for
+# both the test-gate crate detection and the deploy step, so neither one
+# accidentally picks up files that changed on master independently of
+# this branch (the same drift problem the three-dot diff above exists to
+# avoid; re-deriving this list post-merge from a two-dot range would
+# reintroduce it).
+BRANCH_FILES="$(git -C "$SIEM_REPO" diff --name-only "master...$BRANCH")"
+[[ -n "$BRANCH_FILES" ]] || die "no diff between master and $BRANCH (already merged via git ancestry, or an empty branch) — nothing to review"
+
+# Ancestry alone isn't a reliable "already merged" signal: a branch merged
+# by squash or cherry-pick (rather than `git merge`) never becomes a git
+# ancestor of master, so `master..branch` still shows it as unmerged
+# forever, even though the content landed. The only robust check is
+# per-file content equality against master's CURRENT tip, not the
+# merge-base.
+ALREADY_MERGED=1
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  diff -q <(git -C "$SIEM_REPO" show "$BRANCH:$f" 2>/dev/null) \
+          <(git -C "$SIEM_REPO" show "master:$f" 2>/dev/null) >/dev/null 2>&1 || ALREADY_MERGED=0
+done <<< "$BRANCH_FILES"
+[[ "$ALREADY_MERGED" -eq 0 ]] || die "every file $BRANCH touches is already byte-identical on master's current tip (already merged/deployed, likely via squash or cherry-pick even though git ancestry doesn't show it) — nothing to review"
+
+# ── 3. test gate — hard gate: a failure aborts before anything is
+#      merged, pushed, deployed, or closed. Runs in a throwaway worktree
+#      so it never disturbs whatever's checked out in $SIEM_REPO itself. ──
+echo "== 3. test gate =="
+CRATES="$(grep -E '^src/[^/]+/(src/|Cargo\.toml$)' <<< "$BRANCH_FILES" \
+  | sed -E 's#^src/([^/]+)/.*#\1#' | sort -u || true)"
+if [[ -z "$CRATES" ]]; then
+  log "no Rust source touched — skipping cargo test"
+else
+  TESTDIR="/tmp/tuner-review-test-$$"
+  git -C "$SIEM_REPO" worktree add -q "$TESTDIR" "$BRANCH"
+  trap 'git -C "$SIEM_REPO" worktree remove --force "'"$TESTDIR"'" >/dev/null 2>&1 || true' EXIT
+  for c in $CRATES; do
+    log "cargo test -p $c ..."
+    if ! (cd "$TESTDIR" && cargo test -p "$c"); then
+      die "TEST FAILURE in $c — aborting. Nothing merged, deployed, or closed."
+    fi
+  done
+  git -C "$SIEM_REPO" worktree remove --force "$TESTDIR"
+  trap - EXIT
+  log "all touched crates: tests passed"
+fi
+
+# ── 4. human approval gate ─────────────────────────────────────────────
+echo "== 4. approve? =="
+read -r -p "  Merge, push, deploy, and close this ticket? [y/N] " REPLY
+[[ "$REPLY" =~ ^[Yy]$ ]] || { echo "  aborted, nothing changed."; exit 0; }
+
+# ── 5. merge (--no-ff, referencing the ticket) ─────────────────────────
+echo "== 5. merge =="
+git -C "$SIEM_REPO" checkout -q master
+git -C "$SIEM_REPO" merge --no-ff "$BRANCH" -m "Merge $BRANCH: ${SUBJECT:-tuner-dev fix}
+
+Reviewed via $TICKET.
+Merged via scripts/tuner-review; test gate passed for: ${CRATES:-<no Rust source touched>}."
+MERGE_SHA="$(git -C "$SIEM_REPO" rev-parse --short HEAD)"
+log "merged as $MERGE_SHA"
+
+# ── 6. push ─────────────────────────────────────────────────────────────
+echo "== 6. push =="
+git -C "$SIEM_REPO" push origin master
+log "pushed"
+
+# ── 7. deploy ────────────────────────────────────────────────────────────
+echo "== 7. deploy =="
+TOUCHED="$BRANCH_FILES"   # reuse the branch's own file list captured in step 2 — see the note there
+RESTART_HINTS=()
+
+for c in $CRATES; do
+  log "redeploy-binary $c (no --restart — restart manually when ready)"
+  "$SIEM_REPO/scripts/redeploy-binary" "$c"
+  case "$c" in
+    normalized|indexd|ruled|correlated) RESTART_HINTS+=("headless-siem-$c") ;;
+    siemctl) : ;;  # no running process
+  esac
+done
+
+# Config files with a known flat production copy (config/systemd/install.sh
+# is the source of truth for this list — keep this table in sync with it).
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  case "$f" in
+    config/sources.toml)       PROD=/etc/headless-siem/sources.toml ;;
+    config/normalized.toml)    PROD=/etc/headless-siem/normalized.toml; RESTART_HINTS+=("headless-siem-normalized") ;;
+    config/digest.toml)        PROD=/etc/headless-siem/digest.toml ;;   # siemctl reads it fresh every run, no service to restart
+    config/correlations.toml)  PROD=/etc/headless-siem/correlations.toml; RESTART_HINTS+=("headless-siem-correlated") ;;
+    config/rules/*)            PROD=/etc/headless-siem/rules; RESTART_HINTS+=("headless-siem-ruled") ;;
+    config/rsyslog.d/50-headless-siem.conf)
+                                log "NOTE: $f changed — this also needs 'cp' to /etc/rsyslog.d/ + 'systemctl restart rsyslog' (see install.sh); not automated here, do it by hand." ; continue ;;
+    config/notify/alert-watch.sh)
+                                PROD=/etc/headless-siem/notify/alert-watch.sh; RESTART_HINTS+=("headless-siem-alert-watch") ;;
+    config/systemd/*)
+                                log "NOTE: $f changed — systemd unit files are not auto-copied; review and install by hand." ; continue ;;
+    config/*)
+                                log "NOTE: $f changed under config/ but has no known production copy in this script's table — check install.sh and copy by hand if needed." ; continue ;;
+    *) continue ;;
+  esac
+  if [[ "$PROD" == *rules ]]; then
+    log "cp -r config/rules -> $PROD (matches install.sh's whole-dir copy)"
+    cp -r "$SIEM_REPO/config/rules" /etc/headless-siem/
+  else
+    log "cp $f -> $PROD"
+    install -o root -g root -m 644 "$SIEM_REPO/$f" "$PROD"
+  fi
+done <<< "$TOUCHED"
+
+# Built once, reused at every point below where you need to know exactly
+# what to run — mid-deploy, right before you verify live, and again in the
+# final summary (so it's still on screen after cargo test/diff/merge output
+# has scrolled past).
+RESTART_CMDS=()
+if [[ ${#RESTART_HINTS[@]} -gt 0 ]]; then
+  while IFS= read -r u; do
+    RESTART_CMDS+=("sudo systemctl restart $u")
+  done < <(printf '%s\n' "${RESTART_HINTS[@]}" | sort -u)
+  echo "  Manual restart needed for:"
+  printf '    %s\n' "${RESTART_CMDS[@]}"
+else
+  log "no restart needed (siemctl-only change, or nothing deployed)"
+fi
+
+echo "== check-deploy-drift =="
+"$SIEM_REPO/scripts/check-deploy-drift" || log "(non-zero exit above is expected until you run the restarts printed above)"
+
+# ── 8. live verification note ──────────────────────────────────────────
+echo "== 8. verify live =="
+if [[ ${#RESTART_CMDS[@]} -gt 0 ]]; then
+  echo "  Run these now, THEN verify — the new code/config isn't live until you do:"
+  printf '    %s\n' "${RESTART_CMDS[@]}"
+fi
+echo "  Re-run the ticket's own verification against real data now, THEN describe the result."
+read -r -p "  Live verification note (for the closing comment): " VERIFY_NOTE
+[[ -n "$VERIFY_NOTE" ]] || die "empty verification note — re-run once you've actually checked."
+
+# ── 9. close the ticket ─────────────────────────────────────────────────
+echo "== 9. close ticket =="
+DEPLOY_SUMMARY="no restart needed"
+[[ ${#RESTART_CMDS[@]} -gt 0 ]] && DEPLOY_SUMMARY="$(IFS='; '; echo "${RESTART_CMDS[*]}")"
+CLOSE_COMMENT="Reviewed and merged via scripts/tuner-review ($MERGE_SHA). Branch: $BRANCH. Tests: ${CRATES:+cargo test -p {${CRATES// /,}} passed}${CRATES:-no Rust source touched}. Deploy: $DEPLOY_SUMMARY. Verified live: $VERIFY_NOTE"
+"$SOC_ROOT/scripts/soc-ticket" close "$TICKET" "$CLOSE_COMMENT"
+log "ticket closed"
+
+# ── 10. optional housekeeping ────────────────────────────────────────────
+echo "== 10. housekeeping (optional) =="
+read -r -p "  Delete local branch '$BRANCH' now that it's merged? [y/N] " REPLY
+if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+  git -C "$SIEM_REPO" branch -d "$BRANCH"
+  log "deleted"
+else
+  log "left in place"
+fi
+
+echo
+if [[ ${#RESTART_CMDS[@]} -gt 0 ]]; then
+  echo "DONE. Restart still pending — run when you're ready:"
+  printf '  %s\n' "${RESTART_CMDS[@]}"
+else
+  echo "DONE. No restart needed."
+fi

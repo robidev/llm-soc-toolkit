@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# scripts/context-balloon-scan — deterministic (non-LLM) backstop for
+# unbounded tool-result growth on disk. A single oversized tool result
+# (grep/find output, a raw log dump, ...) written into a role's own
+# session transcript is the thing that caused the real 3.3-3.7MB
+# context-ballooning incident this item exists to catch early, before
+# it silently inflates every subsequent turn's context in that session.
+#
+# Root, unsandboxed — must read across all 4 soc-<role>-owned home
+# trees under /var/lib/soc, same reason soc-escalate needs root. Not a
+# tool any role invokes itself; runs from soc-run-role's periodic
+# cadence gate alongside heal-permissions --all and soc-escalate
+# (item A1), or by hand.
+#
+# Layout scanned (confirmed real, 2026-07-12):
+#   /var/lib/soc/<role-home>/.claude/projects/<project>/<session-uuid>/tool-results/*.txt
+# — a session is normally just <uuid>.jsonl; the tool-results/ sibling
+# dir only exists for large results, which is exactly the population
+# this scan is over.
+#
+# Checkpointing: per-role .context-scan-state/<role>.checkpoint, one
+# "path:mtime:size" line per file currently at-or-above the threshold.
+# A file already in the checkpoint is not re-flagged; a file rewritten
+# in place (new mtime) gets a new key and is treated as new, since a
+# re-inflation is itself worth another look. Checkpoint entries whose
+# file no longer exists (e.g. scripts/soc-session-cleanup, item B, has
+# since deleted the session) are dropped on the next run rather than
+# kept forever.
+#
+# USAGE: context-balloon-scan (no arguments, must run as root)
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TICKET_DIR="$PROJECT_ROOT/ticketing-system/user"
+STATE_DIR="$PROJECT_ROOT/.context-scan-state"
+SOC_NOTIFY="$SCRIPT_DIR/soc-notify"
+SOC_LIB="${SOC_LIB:-/var/lib/soc}"   # env override for testing, same pattern as soc-escalate's HOOK_MODE_FILE
+THRESHOLD_BYTES=200000               # matches the plan's "~200KB" spec; confirmed real outliers run 3.3-3.7MB
+
+log() { echo "[context-balloon-scan] $*" >&2; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    log "must run as root (reads across all soc-<role>-owned homes) — try: sudo $0"
+    exit 1
+fi
+
+mkdir -p "$STATE_DIR"
+chown soc-infra:socroles "$STATE_DIR" 2>/dev/null || true
+chmod 770 "$STATE_DIR" 2>/dev/null || true
+
+human_size() {  # <bytes>
+    awk -v b="$1" 'BEGIN {
+        if (b >= 1048576) printf "%.1fMB", b/1048576;
+        else printf "%.1fKB", b/1024;
+    }'
+}
+
+exit_code=0
+
+for role in analyst specialist tuner-dev soclead; do
+    role_home="$SOC_LIB/${role/tuner-dev/tunerdev}"   # same substitution soc-run-role uses to derive $home
+    projects_dir="$role_home/.claude/projects"
+    checkpoint_file="$STATE_DIR/$role.checkpoint"
+
+    [ -d "$projects_dir" ] || continue   # role has never had a session yet
+
+    # Current files at-or-above the threshold: "path:mtime:size" lines.
+    # mindepth/maxdepth 4 relative to projects_dir matches the confirmed
+    # layout exactly: <project>/<session-uuid>/tool-results/<file>.txt.
+    current_file="$(mktemp)"
+    while IFS= read -r -d '' f; do
+        size="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+        [ "$size" -ge "$THRESHOLD_BYTES" ] || continue
+        mtime="$(stat -c '%Y' "$f" 2>/dev/null || echo 0)"
+        printf '%s:%s:%s\n' "$f" "$mtime" "$size"
+    done < <(find "$projects_dir" -mindepth 4 -maxdepth 4 -type f -path '*/tool-results/*.txt' -print0 2>/dev/null) \
+        | sort > "$current_file"
+
+    checkpoint=""
+    [ -f "$checkpoint_file" ] && checkpoint="$(sort "$checkpoint_file")"
+
+    new_entries="$(comm -23 "$current_file" <(printf '%s\n' "$checkpoint") 2>/dev/null)"
+    new_count=0
+    [ -n "$new_entries" ] && new_count="$(printf '%s\n' "$new_entries" | grep -c .)"
+
+    # Updated checkpoint = every currently-flagged file (old + new) —
+    # this is what naturally prunes entries for files that were since
+    # deleted (item B's session cleanup) without any extra bookkeeping.
+    cp "$current_file" "$checkpoint_file"
+    chown soc-infra:socroles "$checkpoint_file" 2>/dev/null || true
+    chmod 640 "$checkpoint_file" 2>/dev/null || true
+    rm -f "$current_file"
+
+    if [ "$new_count" -eq 0 ]; then
+        continue
+    fi
+
+    body_file="$(mktemp -p "$STATE_DIR")"
+    {
+        echo "Role: $role"
+        echo "Threshold: $THRESHOLD_BYTES bytes ($(human_size "$THRESHOLD_BYTES"))"
+        echo "New oversized tool-result(s) this run: $new_count"
+        echo ""
+        echo "A large tool result sitting in a session transcript inflates every"
+        echo "subsequent turn's context for that session until it's compacted or"
+        echo "the session ends — this is the same failure mode as the 2026-07"
+        echo "context-ballooning incident. Not necessarily actionable on its own;"
+        echo "worth a look if the same role/tool keeps reappearing here."
+        echo ""
+        echo '```'
+        while IFS=: read -r path mtime size; do
+            printf '%-10s  %s  %s\n' "$(human_size "$size")" "$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "?")" "$path"
+        done <<< "$new_entries"
+        echo '```'
+    } > "$body_file"
+
+    ts_file="$(date -u +%Y%m%dT%H%M%S).$(date -u +%N | cut -c1-3)"
+    ts_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ticket_name="${ts_file}_context-balloon-${role}.md"
+    ticket_path="$TICKET_DIR/$ticket_name"
+
+    {
+        echo "---"
+        echo "issuer: soc-infra"
+        echo "type: context_balloon"
+        echo "priority: low"
+        echo "status: open"
+        echo "created: $ts_iso"
+        echo "closed:"
+        echo "---"
+        echo ""
+        echo "## Subject"
+        echo ""
+        echo "context-balloon-scan: $new_count new oversized tool-result$([ "$new_count" -eq 1 ] || echo s) for role $role"
+        echo ""
+        echo "## Details"
+        echo ""
+        cat "$body_file"
+        echo ""
+        echo "## Comments"
+        echo ""
+        echo "- $ts_iso soc-infra: Filed automatically by scripts/context-balloon-scan."
+    } > "$ticket_path"
+    chown soc-infra:socroles "$ticket_path"
+    chmod 640 "$ticket_path"
+
+    log "filed $ticket_name ($new_count new outlier(s), role=$role)"
+
+    chown soc-infra:socroles "$body_file"
+    chmod 640 "$body_file"
+
+    if runuser -u soc-infra -- "$SOC_NOTIFY" low "SOC context balloon: $role ($new_count new)" "$body_file" "context_balloon"; then
+        log "notified (low): $role"
+    else
+        log "soc-notify failed for $role — ticket $ticket_name still filed, will not re-notify until next new entry"
+        exit_code=1
+    fi
+
+    rm -f "$body_file"
+done
+
+exit "$exit_code"

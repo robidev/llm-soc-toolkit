@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#
+# siemctl shim — runner-and-permissions.md §11.2(2), item C.
+#
+# Pins --data-dir so a (possibly prompt-injected) role cannot redirect
+# siemctl's view of the SIEM to an arbitrary directory via --data-dir/-d.
+# The pinned value is APPENDED LAST; siemctl resolves data-dir last-wins
+# (verified in source, main.rs:859 et al.), so it overrides any caller
+# --data-dir or -d. An adversarial trailing "--data-dir" that tries to
+# eat our token fails closed (siemctl's is_dir() check, main.rs:896).
+#
+# Installed root-owned to /usr/local/lib/soc/bin/siemctl and placed
+# EARLIER on each role's PATH than /usr/local/bin (the runner sets
+# PATH=/usr/local/lib/soc/bin:$PATH). Root-owned so a role cannot alter
+# the pin. Calls the real binary by absolute path (no PATH recursion).
+#
+set -euo pipefail
+
+REAL=/usr/local/bin/siemctl
+DATA_DIR=/var/lib/headless-siem   # pinned live data dir
+# Optional root-controlled override; ignored if absent.
+[[ -r /etc/headless-siem/soc-data-dir ]] && DATA_DIR="$(cat /etc/headless-siem/soc-data-dir)"
+
+exec "$REAL" "$@" --data-dir "$DATA_DIR"

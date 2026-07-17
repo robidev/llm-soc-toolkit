@@ -1,0 +1,15 @@
+[Unit]
+Description=LLM-based SOC - Soclead Nightly Report Timer
+
+[Timer]
+# 02:00, not midnight -- same rollover caution as
+# soc-baseline.timer (every real failure of that one so far
+# correlated with the 00:00-00:15 indexd bucket-rollover window). An hour
+# clear of soc-soclead-weekly.timer below so the two never contend for
+# soclead's flock lock (nightly's own worst case is TIMEOUT=900s=15min).
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

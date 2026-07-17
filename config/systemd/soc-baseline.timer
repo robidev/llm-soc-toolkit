@@ -1,0 +1,14 @@
+[Unit]
+Description=LLM-based SOC - Daily Baseline Digest Capture Timer
+
+[Timer]
+# Deliberately not midnight: hour/day rollover in indexd's bucket files
+# happens right around 00:00-00:15, so a capture scheduled there can race
+# it. Noon is a quiet, unremarkable hour with no other known rollover
+# activity nearby.
+OnCalendar=*-*-* 12:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

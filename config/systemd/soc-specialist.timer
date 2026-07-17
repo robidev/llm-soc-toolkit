@@ -1,0 +1,14 @@
+[Unit]
+Description=LLM-based SOC - Specialist Role Run Timer
+
+[Timer]
+# Target cadence (soc-structure/overall.md): every hour.
+# Runs at :20 past the hour -- offset 20min after soc-analyst.timer's
+# top-of-hour :00, well clear of either's RandomizedDelaySec jitter, so
+# the two roles' runs don't overlap.
+OnCalendar=*-*-* *:20:00
+RandomizedDelaySec=3m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
