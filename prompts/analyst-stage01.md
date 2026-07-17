@@ -1,6 +1,6 @@
 ---
 # Stage envelope: appended by soc-run-role for the FIRST (Haiku) call of
-# the §5.4 two-call contract (soc-structure/runner-and-permissions.md).
+# the two-call contract (soc-structure/runner-and-permissions.md).
 # Everything above is the shared analyst
 # brain; this envelope scopes THIS call to Stage 0/1 and defines the
 # fence the wrapper parses. Do not treat anything here as overriding the

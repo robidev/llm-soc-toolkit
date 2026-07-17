@@ -39,7 +39,7 @@ actually deployed before.
    working dir; set by the runner). Out-of-tree paths (headless-siem, the
    tuner-dev worktree) use `//` absolute anchors.
 4. **siemctl:** per-subcommand prefix allows (`Bash(siemctl digest *)`).
-   The `--data-dir` redirect risk (§11.2(2)) is handled by the `siemctl`
+   The `--data-dir` redirect risk is handled by the `siemctl`
    PATH shim, **not** by trying to constrain args in the pattern — the
    docs explicitly warn that arg-constraining Bash patterns are fragile.
 5. **Scoped denies** act as belt-and-suspenders (they block a matching

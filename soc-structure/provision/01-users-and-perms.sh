@@ -42,7 +42,7 @@ log() { printf '  %s\n' "$*"; }
 [[ -d $SOC_ROOT ]] || { echo "SOC_ROOT not found: $SOC_ROOT"; exit 1; }
 getent passwd "$HUMAN" >/dev/null || { echo "operator account '$HUMAN' not found"; exit 1; }
 
-echo "== §2: group + users =="
+echo "== group + users =="
 
 if getent group socroles >/dev/null; then log "group socroles exists"; else
   groupadd --system socroles; log "created group socroles"; fi
@@ -77,7 +77,7 @@ chgrp socroles /home/user
 chmod 710 /home/user
 log "chgrp socroles + chmod 710 on /home/user (traverse, not list)"
 
-echo "== §3: hard-layer filesystem ownership/modes =="
+echo "== hard-layer filesystem ownership/modes =="
 cd "$SOC_ROOT"
 
 # Ownership model:
@@ -106,14 +106,14 @@ tree_perms ticketing-system/tuner-dev  soc-tunerdev:socroles   750 640
 tree_perms ticketing-system/soclead    soc-soclead:socroles    750 640
 
 # user/ : human inbox — operator-owned, group-writable so any role can
-#         file directly (§4); setgid so new files inherit socroles.
+#         file directly; setgid so new files inherit socroles.
 chown "$HUMAN:socroles" ticketing-system/user
 find ticketing-system/user -type f -exec chown "$HUMAN:socroles" {} + 2>/dev/null || true
 find ticketing-system/user -type f -exec chmod 640 {} + 2>/dev/null || true
 chmod 2770 ticketing-system/user
 
 # unassigned/ : neutral create-then-move staging; setgid+sticky (/tmp-like)
-#               so a role can't delete another role's staged file (§3).
+#               so a role can't delete another role's staged file.
 chown root:socroles ticketing-system/unassigned
 find ticketing-system/unassigned -type f -exec chown root:socroles {} + 2>/dev/null || true
 find ticketing-system/unassigned -type f -exec chmod 640 {} + 2>/dev/null || true

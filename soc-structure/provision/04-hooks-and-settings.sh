@@ -3,7 +3,7 @@
 # 04-hooks-and-settings.sh
 #
 # Installs the PreToolUse hook + per-role settings + append-only audit
-# logs into root-owned /etc/soc/ (the integrity point, §5.1/§7). Wires
+# logs into root-owned /etc/soc/. Wires
 # the hook in audit mode. Idempotent; requires root.
 #   sudo bash 04-hooks-and-settings.sh
 #

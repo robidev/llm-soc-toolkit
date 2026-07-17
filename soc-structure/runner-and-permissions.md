@@ -17,7 +17,7 @@ Two independent layers, one hard and fixed, one soft and tunable.
    `permissions`, the `hook-check` `PreToolUse` hook). The finer-grained
    boundary ("may run `siemctl digest` but not `siemctl retention`," "may
    call `soc-notify` only at `high`/`critical`"). This layer has a
-   per-role **audit → enforce** mode (§7) — audit mode only ever
+   per-role **audit → enforce** mode — audit mode only ever
    loosens the soft layer, never the hard one underneath it.
 
 ## 2. Unix users and groups
@@ -424,7 +424,7 @@ prompt-injection indicator).
    syntax structurally (validate the loop body's commands, not the
    loop's literal text) — a change to the matcher itself rather than an
    additive branch or manifest data; treat it with the same care as the
-   rest of the security boundary (§11).
+   rest of the security boundary.
 
 ## 10. Prompt-injection mitigations in place
 

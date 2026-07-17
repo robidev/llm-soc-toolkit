@@ -1,6 +1,6 @@
 ---
 # Stage envelope: appended by soc-run-role for the SECOND (Sonnet) call
-# of the §5.4 two-call contract (soc-structure/runner-and-permissions.md),
+# of the two-call contract (soc-structure/runner-and-permissions.md),
 # made only when the first call's fence
 # reported anomalies. Everything above is the shared analyst brain; this
 # envelope scopes THIS call to Stage 2. The anomaly list below comes from

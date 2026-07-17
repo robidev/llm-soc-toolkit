@@ -7,9 +7,6 @@
 # it as soc-infra keeps .notify-count/ ownership consistent with every
 # other soc-infra-authored artifact). Every role manifest has allow-listed
 # this exact `sudo -u soc-infra .../soc-notify <priority> *` invocation
-# since §6 was first written, but the sudoers grant to make it possible
-# was never actually provisioned until this was found (alongside the
-# separate NoNewPrivileges/sudo conflict, same investigation).
 #
 # Which PRIORITY a role may actually invoke stays enforced at the
 # Claude-Code manifest layer (per-role allow/deny Bash patterns), not

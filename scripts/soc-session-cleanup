@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # scripts/soc-session-cleanup — deletes old per-invocation session
-# transcripts under /var/lib/soc/<role>/.claude/projects/ (phase7
-# housekeeping build, cluster 1 item B / §7.2), so 4 roles' worth of
+# transcripts under /var/lib/soc/<role>/.claude/projects/, so 4 roles' worth of
 # never-`--resume`d session state doesn't grow unbounded on disk.
 #
 # Root, unsandboxed — must delete files owned by 4 different

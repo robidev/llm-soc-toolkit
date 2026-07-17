@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # 05-siemctl-shim.sh — implements runner-and-permissions.md §10 (siemctl
-# PATH shim mitigation) + §5.2.
+# PATH shim mitigation)
 #
 # Installs the root-owned siemctl shim that pins --data-dir, and applies
-# the §5.2 siemctl access grant (analyst may write the ack watermark).
+# the siemctl access grant (analyst may write the ack watermark).
 # Idempotent; requires root.  sudo bash 05-siemctl-shim.sh
 #
 # NOTE for the runner (item E / base wrapper): each role's PATH must put
@@ -29,7 +29,7 @@ install -d -o root -g root -m 755 "$SHIM_DIR"
 install -o root -g root -m 755 "$SHIM_SRC" "$SHIM_DIR/siemctl"
 log "installed $SHIM_DIR/siemctl (root:root 755) -> pins --data-dir, execs $REAL"
 
-echo "== §5.2 siemctl access: analyst may write the ack watermark =="
+echo "== siemctl access: analyst may write the ack watermark =="
 # Data-dir group read is already satisfied by the live tree's 775/664
 # ('other' read). Only the single ack.jsonl needs a writer grant: it is
 # written ONLY by siemctl (services read it), and only the analyst

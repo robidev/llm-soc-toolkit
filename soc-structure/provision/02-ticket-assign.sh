@@ -2,7 +2,7 @@
 #
 # 02-ticket-assign.sh
 #
-# Installs the ticket-assign trusted helper (§4) and its narrowly scoped
+# Installs the ticket-assign trusted helper and its narrowly scoped
 # sudoers rule. Idempotent; requires root. Run:
 #   sudo bash 02-ticket-assign.sh
 #

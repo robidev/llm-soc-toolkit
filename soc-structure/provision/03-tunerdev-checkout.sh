@@ -24,7 +24,7 @@ set -euo pipefail
 
 SOC_ROOT=/home/user/projects/llm-soc-toolkit      # [SOC-ROOT-PATH]
 SRC_REPO=/home/user/projects/headless-siem       # [SOC-ROOT-PATH] the dev checkout (NOT the live binaries in /usr/local/bin)
-CHECKOUT=/var/lib/soc/tunerdev/headless-siem     # soc-tunerdev's own clone; manifest §6 <tuner-dev worktree>
+CHECKOUT=/var/lib/soc/tunerdev/headless-siem     # soc-tunerdev's own clone; <tuner-dev worktree>
 TUNER=soc-tunerdev
 
 log() { printf '  %s\n' "$*"; }

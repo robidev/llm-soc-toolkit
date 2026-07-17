@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """heal-permissions
 
-Runs as root, from soc-run-role, OUTSIDE any role's sandbox (phase7
-housekeeping build, cluster 1 item C / §7.3). Backstop against
+Runs as root, from soc-run-role, OUTSIDE any role's sandbox. Backstop against
 permission drift that's already happened by hand at least 3 times:
 files that end up owned by the wrong soc-<role> account, or with the
 wrong mode, after some out-of-band operation (a manual chown while

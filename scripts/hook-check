@@ -328,7 +328,7 @@ def main():
         log(role, "DENY", tool, "%s %s" % (detail, reason))
         emit("deny", "[soc-hook/enforce] %s" % reason)
     else:
-        # §7 Stage A: the hook NEVER blocks; the narrow native deny list is
+        # the hook NEVER blocks; the narrow native deny list is
         # what actually blocks catastrophic calls during audit. Log and allow.
         log(role, "AUDIT-%s" % ("DENYMATCH" if verdict == "deny" else "NOMATCH"),
             tool, "%s %s" % (detail, reason))
