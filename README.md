@@ -16,6 +16,8 @@ all the actual mechanism, not a design sketch. What's deployment-specific
 channel) ships as empty templates for you to fill in — see the
 [deployment guide](documentation/deployment-guide.md).
 
+Development was mainly vide-coded with Claude, under human supervision 
+
 ## Architecture
 
 ```
